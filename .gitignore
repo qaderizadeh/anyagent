@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+
+# DeepSeek session credentials — keep out of version control
+DEEPSEEK_SESSION_JSON
+DEEPSEEK_SESSION_PATH
+
+# Local test artifacts (not part of the project)
+/my-express-app/
+/screenshot-app/

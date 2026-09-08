@@ -1,0 +1,28 @@
+{
+  "name": "anyagent",
+  "version": "1.0.0",
+  "description": "Personal CLI AI agent that talks directly to chat.deepseek.com — no API key, no browser automation",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "anyagent": "dist/cli.js"
+  },
+  "homepage": "https://anydev.ir",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/qaderizadeh/anyagent.git"
+  },
+  "author": "anydev.ir",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/cli.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  }
+}
