@@ -123,8 +123,8 @@ function findJsonObjectEnd(text: string, startIdx: number): number {
 /**
  * Leniently repair common model-generated JSON mistakes so the block can
  * be parsed: escape literal control characters inside string values (the
- * model often emits real newlines/tabs in file contents) and drop trailing
- * commas before } or ].
+ * model often emits real newlines/tabs in file contents), fix invalid
+ * escape sequences, and drop trailing commas before } or ].
  */
 function repairJsonText(text: string): string {
   let out = "";
@@ -139,7 +139,26 @@ function repairJsonText(text: string): string {
         escaped = false;
         continue;
       }
-      if (ch === "\\") { out += ch; escaped = true; continue; }
+      if (ch === "\\") {
+        const next = text[i + 1];
+        const simpleEscape =
+          next === '"' || next === "\\" || next === "/" ||
+          next === "b" || next === "f" || next === "n" ||
+          next === "r" || next === "t";
+        const unicodeEscape =
+          next === "u" && /^[0-9a-fA-F]{4}$/.test(text.slice(i + 2, i + 6));
+        if (simpleEscape || unicodeEscape) {
+          out += ch;
+          escaped = true;
+          continue;
+        }
+        // Invalid JSON escape: the model mixed shell escaping into the JSON
+        // string (e.g. \$ or \' ), which JSON.parse rejects. Preserve the
+        // backslash as a literal character by escaping it, so the command
+        // still reaches the shell exactly as the model intended.
+        out += "\\\\";
+        continue;
+      }
       if (ch === '"') { out += ch; inString = false; continue; }
       if (code === 10) { out += "\\n"; continue; }
       if (code === 13) { out += "\\r"; continue; }
@@ -269,7 +288,7 @@ function rebalanceJson(text: string): string {
  * in ```json fences. Returns the parsed calls and the start index of the
  * JSON, or null.
  */
-function extractToolCallsFromText(
+export function extractToolCallsFromText(
   text: string,
 ): { calls: ToolCallList; startIdx: number } | null {
   const marker = '"tool_calls"';

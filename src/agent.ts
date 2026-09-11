@@ -24,6 +24,21 @@ const TOOL_USAGE_INSTRUCTIONS = `Do real work with your shell tool. Whenever an 
 {"tool_calls":[{"id":"1","type":"function","function":{"name":"shell","arguments":{"command":"COMMAND"}}}]}
 Tool results come back as {"exitCode":...,"stdout":...,"stderr":...}. Read them, then continue or finish.`;
 
+const MAX_UNPARSEABLE_TOOL_CALL_RETRIES = 3;
+
+const UNPARSEABLE_TOOL_CALL_NUDGE = `Your previous message was a tool-call JSON block that could not be parsed. Do not explain it or apologize — just re-send the tool call as valid JSON on a single line, in exactly this shape:
+{"tool_calls":[{"id":"1","type":"function","function":{"name":"shell","arguments":{"command":"COMMAND"}}}]}
+Escape only double quotes and backslashes. Never escape any other character (no \\$, no \\', no \\. ).`;
+
+/**
+ * True when a "final answer" is really a tool-call block the parser could not
+ * read. Showing that raw JSON to the user is never useful: it means the model
+ * asked for an action that never ran.
+ */
+function looksLikeUnparsedToolCall(text: string): boolean {
+  return /"tool_calls"\s*:/.test(text) && /"function"\s*:/.test(text);
+}
+
 export type AgentOptions = {
   model: Model;
   tools: Record<string, Tool>;
@@ -155,6 +170,8 @@ export class Agent {
 
     const definitions = Object.values(this.tools).map((tool) => tool.definition);
 
+    let unparseableAttempts = 0;
+
     for (let iteration = 0; iteration < this.maxIterations; iteration++) {
       const assistant = await this.chatWithRetry(definitions);
 
@@ -168,6 +185,21 @@ export class Agent {
           this.messages.push({ role: "assistant", content: text });
           this.messages.push({ role: "user", content: "Please provide your final answer now." });
           continue;
+        }
+        // Never surface an unparsed tool-call block as the final answer: it
+        // means the model wanted an action that never ran. Ask it to re-send
+        // the call, a bounded number of times, then fail honestly.
+        if (looksLikeUnparsedToolCall(display)) {
+          unparseableAttempts++;
+          if (unparseableAttempts <= MAX_UNPARSEABLE_TOOL_CALL_RETRIES) {
+            this.messages.push({ role: "assistant", content: text });
+            this.messages.push({ role: "user", content: UNPARSEABLE_TOOL_CALL_NUDGE });
+            continue;
+          }
+          return (
+            "Agent stopped: the model returned malformed tool-call JSON " +
+            `${MAX_UNPARSEABLE_TOOL_CALL_RETRIES} times and it could not be parsed.`
+          );
         }
         this.messages.push({ role: "assistant", content: text });
         return display;
