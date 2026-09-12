@@ -23,17 +23,32 @@ const MAX_UNPARSEABLE_TOOL_CALL_RETRIES = 3;
  *  muted backend otherwise burns every iteration returning nothing). */
 const MAX_EMPTY_RESPONSES = 5;
 
-const UNPARSEABLE_TOOL_CALL_NUDGE = `Your previous message was a tool-call JSON block that could not be parsed. Do not explain it or apologize — just re-send the tool call as valid JSON on a single line, in exactly this shape:
+const UNPARSEABLE_TOOL_CALL_NUDGE = `Your previous message was a tool call that could not be parsed. Do not explain it or apologize — just re-send the tool call as valid JSON on a single line, in exactly this shape:
 {"tool_calls":[{"id":"1","type":"function","function":{"name":"shell","arguments":{"command":"COMMAND"}}}]}
+Never use XML tags such as <tool_calls>, <invoke> or <parameter> — only the JSON above.
 Escape only double quotes and backslashes. Never escape any other character (no \\$, no \\', no \\. ).`;
 
+/** Retryable failures: a network hiccup or a transient backend refusal. */
+const RETRYABLE_ERROR_KINDS: ReadonlyArray<ModelError["kind"]> = ["network", "pow-error"];
+/** Backoff between retries of a transient failure. */
+const RETRY_DELAYS_MS = [1000, 4000];
+
 /**
- * True when a "final answer" is really a tool-call block the parser could not
- * read. Showing that raw JSON to the user is never useful: it means the model
- * asked for an action that never ran.
+ * True when a "final answer" is really a tool call the parser could not read —
+ * either a JSON block or the XML markup some replies fall back to:
+ *
+ *   <tool_calls>
+ *     <invoke name="shell">
+ *       <parameter name="command">ls -la</parameter>
+ *     </invoke>
+ *   </tool_calls>
+ *
+ * Showing either to the user is never useful: it means the model asked for an
+ * action that never ran.
  */
 function looksLikeUnparsedToolCall(text: string): boolean {
-  return /"tool_calls"\s*:/.test(text) && /"function"\s*:/.test(text);
+  if (/"tool_calls"\s*:/.test(text) && /"function"\s*:/.test(text)) return true;
+  return /<\/?tool_calls\b|<\/?function_calls\b|<invoke\s+name\s*=/i.test(text);
 }
 
 export type AgentOptions = {
@@ -143,21 +158,26 @@ export class Agent {
   }
 
   /**
-   * Ask the model, retrying once on transient failures (network hiccups,
-   * pow refreshes). The conversation is only mutated after a successful
-   * chat, so retrying with the same messages is safe. Session problems are
-   * not transient and are rethrown immediately.
+   * Ask the model, retrying transient failures (a dropped connection, a
+   * timeout, an HTTP 429/5xx) twice with a short backoff. The conversation is
+   * only mutated after a successful chat, so retrying with the same messages
+   * is safe. Everything deterministic — a dead session, a mute, a malformed
+   * reply, a stale message id — is rethrown immediately.
    */
   private async chatWithRetry(definitions: ToolDefinition[]): Promise<ChatMessage> {
-    try {
-      return await this.model.chat(this.messages, definitions);
-    } catch (error) {
-      if (error instanceof ModelError && error.kind === "invalid-session") {
-        throw error;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.model.chat(this.messages, definitions);
+      } catch (error) {
+        // Only transport-level failures are worth repeating. A session
+        // problem, a mute, or a malformed reply is deterministic — repeating
+        // it just burns quota and hides the real cause.
+        const retryable =
+          error instanceof ModelError &&
+          RETRYABLE_ERROR_KINDS.includes(error.kind);
+        if (!retryable || attempt >= RETRY_DELAYS_MS.length) throw error;
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt]));
       }
-      // One retry after a short pause; if it fails again, surface it.
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-      return await this.model.chat(this.messages, definitions);
     }
   }
 

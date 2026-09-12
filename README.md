@@ -154,6 +154,20 @@ example `biz_code 5: user is muted` after too many requests in a burst), the age
 reports it plainly and stops instead of looping. A mute is a DeepSeek-side limit
 on automated use: wait for it to expire, then retry — nothing needs re-capturing.
 
+Tool calls are read from either format a reply might use — the documented
+`{"tool_calls":[...]}` JSON, or the XML markup
+(`<tool_calls><invoke name="shell"><parameter name="command">…`) that replies
+occasionally fall back to. If a call still cannot be read it is **never** printed
+at you as an answer; the agent asks the model to re-send it as JSON, a few times,
+then stops with a clear message.
+
+Transient failures are distinguished from real ones. A dropped connection, DNS
+failure, or `HTTP 429/5xx` is retried twice with a short backoff, and if it keeps
+failing you get the actual reason (`Cannot reach chat.deepseek.com …:
+ECONNREFUSED`) instead of a bare `fetch failed`. Deterministic failures — a mute,
+an invalid session, a malformed reply — are **not** retried, since repeating them
+only burns quota and hides the cause.
+
 Commands:
 
 ```

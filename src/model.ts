@@ -61,7 +61,14 @@ export type ModelOptions = {
 };
 
 export class ModelError extends Error {
-  readonly kind?: "invalid-session" | "backend-error" | "pow-error" | "parse-error" | "unknown";
+  readonly kind?:
+    | "invalid-session"
+    | "backend-error"
+    | "pow-error"
+    | "parse-error"
+    /** Transport failure or a 429/5xx — the caller may retry these. */
+    | "network"
+    | "unknown";
 
   constructor(message: string, options: { kind?: ModelError["kind"]; cause?: unknown } = {}) {
     super(message, { cause: options.cause });
@@ -316,6 +323,59 @@ function rebalanceJson(text: string): string {
     out += stack.pop() === "o" ? "}" : "]";
   }
   return out;
+}
+
+/**
+ * Some replies write the tool call as markup instead of JSON:
+ *
+ *   <tool_calls>
+ *     <invoke name="shell">
+ *       <parameter name="command">ls -la</parameter>
+ *     </invoke>
+ *   </tool_calls>
+ *
+ * Closing tags are sometimes escaped (`<\/tool_calls>`). Recognize the shape
+ * so the action is executed instead of being printed at the user as text.
+ */
+export function extractXmlToolCalls(
+  text: string,
+): { calls: ToolCallList; startIdx: number } | null {
+  const startMatch = /<tool_calls\b|<function_calls\b|<invoke\s+name\s*=\s*["']/i.exec(text);
+  if (!startMatch) return null;
+  const startIdx = startMatch.index;
+
+  // Work on the tail only, so startIdx stays valid for the caller. Only the
+  // closing tags can carry the stray backslash.
+  const scope = text.slice(startIdx).replace(/<\\\//g, "</");
+
+  const calls: ToolCallList = [];
+  const invokeRe = /<invoke\s+name\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/invoke>/gi;
+  for (const match of scope.matchAll(invokeRe)) {
+    const name = (match[1] ?? "").trim();
+    if (!name) continue;
+    const body = match[2] ?? "";
+    const args: Record<string, string> = {};
+
+    // <parameter name="k">value</parameter>
+    const elementRe = /<parameter\s+name\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/parameter>/gi;
+    for (const param of body.matchAll(elementRe)) {
+      args[(param[1] ?? "").trim()] = (param[2] ?? "").trim();
+    }
+    // <parameter name="k" value="v" />
+    const attrRe = /<parameter\s+name\s*=\s*["']([^"']+)["'][^>]*\bvalue\s*=\s*["']([^"']*)["'][^>]*\/?>/gi;
+    for (const param of body.matchAll(attrRe)) {
+      const key = (param[1] ?? "").trim();
+      if (!(key in args)) args[key] = param[2] ?? "";
+    }
+
+    calls.push({
+      id: String(calls.length + 1),
+      type: "function",
+      function: { name, arguments: JSON.stringify(args) },
+    });
+  }
+
+  return calls.length > 0 ? { calls, startIdx } : null;
 }
 
 /**
@@ -612,28 +672,33 @@ export class Model {
 
     // Send the turn. A stale session/parent linkage must never brick the
     // conversation (see sendTurnWithRecovery).
-    const turn = await sendTurnWithRecovery(
-      { chatSessionId, parentMessageId, basePrompt, seededPrompt },
-      (request) =>
-        runChat(
-          this.session,
-          {
-            session: this.session,
-            chat_session_id: request.chat_session_id,
-            parent_message_id: request.parent_message_id,
-            prompt: request.prompt,
-            model_type: this.modelType,
-            thinking_enabled: this.thinkingEnabled,
-            search_enabled: this.searchEnabled,
-          },
-          this.powWasmPath,
-        ),
-      () => createChatSession(this.session),
-      (kind) =>
-        this.showLinkageNotice(
-          kind === "new-session" ? LOST_SESSION_NOTICE : LOST_PARENT_NOTICE,
-        ),
-    );
+    let turn: Awaited<ReturnType<typeof sendTurnWithRecovery>>;
+    try {
+      turn = await sendTurnWithRecovery(
+        { chatSessionId, parentMessageId, basePrompt, seededPrompt },
+        (request) =>
+          runChat(
+            this.session,
+            {
+              session: this.session,
+              chat_session_id: request.chat_session_id,
+              parent_message_id: request.parent_message_id,
+              prompt: request.prompt,
+              model_type: this.modelType,
+              thinking_enabled: this.thinkingEnabled,
+              search_enabled: this.searchEnabled,
+            },
+            this.powWasmPath,
+          ),
+        () => createChatSession(this.session),
+        (kind) =>
+          this.showLinkageNotice(
+            kind === "new-session" ? LOST_SESSION_NOTICE : LOST_PARENT_NOTICE,
+          ),
+      );
+    } catch (error) {
+      throw toModelError(error);
+    }
     const result = turn.result;
 
     // Remember the session and message id for the next step of this
@@ -648,7 +713,10 @@ export class Model {
     let toolCalls: ToolCallList = [];
     let cleanText = text;
     if (text) {
-      const extracted = extractToolCallsFromText(text);
+      // JSON first (the documented format), then the XML markup some
+      // replies fall back to. Both give the index the call starts at.
+      const extracted =
+        extractToolCallsFromText(text) ?? extractXmlToolCalls(text);
       if (extracted) {
         toolCalls = extracted.calls;
         cleanText = text.slice(0, extracted.startIdx).trimEnd();
@@ -713,6 +781,18 @@ function buildPrompt(
     "information or actions. When the task is fully complete, respond " +
     "with your final answer as plain text."
   );
+}
+
+/**
+ * Re-throw a backend failure as a ModelError so callers have a single error
+ * type to reason about (and can tell retryable transport failures from
+ * application-level ones).
+ */
+function toModelError(error: unknown): unknown {
+  if (error instanceof DeepseekClientError) {
+    return new ModelError(error.message, { kind: error.kind, cause: error });
+  }
+  return error;
 }
 
 export type LinkageKind = "new-session" | "drop-parent";

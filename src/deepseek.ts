@@ -54,7 +54,14 @@ export type DeepseekSessionFile = DeepseekSession & {
 };
 
 export type DeepseekError = {
-  type: "invalid-session" | "backend-error" | "pow-error" | "parse-error" | "unknown";
+  type:
+    | "invalid-session"
+    | "backend-error"
+    | "pow-error"
+    | "parse-error"
+    /** Transport-level failure or a 429/5xx: worth retrying. */
+    | "network"
+    | "unknown";
   message: string;
 };
 
@@ -168,6 +175,49 @@ export function defaultSessionPath(): string {
   return path.resolve(process.cwd(), "DEEPSEEK_SESSION_JSON");
 }
 
+/** Path portion of a URL, for error messages that must never leak a token. */
+function pathOf(url: string): string {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * A bare "fetch failed" from undici tells the user nothing: the real reason
+ * (DNS, connection reset, TLS, timeout) hides in error.cause. Surface it.
+ */
+function describeTransportError(url: string, error: unknown): string {
+  const err = error as { message?: string; cause?: { code?: string; message?: string } };
+  const cause = err?.cause;
+  const detail = [cause?.code, cause?.message ?? err?.message]
+    .filter((part): part is string => typeof part === "string" && part !== "")
+    .join(": ");
+  return `Cannot reach chat.deepseek.com (${pathOf(url)})${detail ? `: ${detail}` : "."}`;
+}
+
+/**
+ * fetch() with transport failures turned into a clear, retryable error, and
+ * 429/5xx treated as transient rather than as a hard failure.
+ */
+async function httpFetch(url: string, init: RequestInit): Promise<Response> {
+  let resp: Response;
+  try {
+    resp = await fetch(url, init);
+  } catch (error) {
+    throw new DeepseekClientError("network", describeTransportError(url, error));
+  }
+
+  if (resp.status === 429 || resp.status >= 500) {
+    throw new DeepseekClientError(
+      "network",
+      `chat.deepseek.com returned HTTP ${resp.status} ${resp.statusText} for ${pathOf(url)}.`,
+    );
+  }
+  return resp;
+}
+
 export function describeSessionIssue(raw: DeepseekError): string {
   if (raw.type === "invalid-session") {
     return (
@@ -244,6 +294,21 @@ export function describeSessionIssue(raw: DeepseekError): string {
       "  - the request was blocked before it reached the chat backend.\n" +
       "\n" +
       "Try re-capturing the session and running again."
+    );
+  }
+
+  if (raw.type === "network") {
+    return (
+      "Could not reach chat.deepseek.com.\n" +
+      "\n" +
+      raw.message +
+      "\n" +
+      "\n" +
+      "Usually this is a temporary network or DNS problem, or DeepSeek\n" +
+      "momentarily refusing traffic. The agent retries these by itself, so you\n" +
+      "only see it when they keep failing.\n" +
+      "\n" +
+      "Check your connection and try the task again."
     );
   }
 
@@ -523,7 +588,7 @@ export async function loadSession(): Promise<DeepseekSessionFile> {
 export async function verifySession(session: DeepseekSession): Promise<void> {
   const headers = buildSessionHeaders(session);
 
-  const resp = await fetch(hostUrl("/api/v0/chat_session/create"), {
+  const resp = await httpFetch(hostUrl("/api/v0/chat_session/create"), {
     method: "POST",
     headers,
     body: JSON.stringify({ agent: "chat" }),
@@ -598,7 +663,7 @@ function readSessionId(data: unknown): string | undefined {
 export async function lightHealthCheck(session: DeepseekSession): Promise<void> {
   const headers = buildSessionHeaders(session);
 
-  const resp = await fetch(hostUrl("/api/v0/chat_session/create"), {
+  const resp = await httpFetch(hostUrl("/api/v0/chat_session/create"), {
     method: "POST",
     headers,
     body: JSON.stringify({ agent: "chat" }),
@@ -718,7 +783,7 @@ export type ChatResult = {
 export async function createChatSession(session: DeepseekSession): Promise<string> {
   const headers = buildSessionHeaders(session);
 
-  const resp = await fetch(hostUrl("/api/v0/chat_session/create"), {
+  const resp = await httpFetch(hostUrl("/api/v0/chat_session/create"), {
     method: "POST",
     headers,
     body: JSON.stringify({ agent: "chat" }),
@@ -793,7 +858,7 @@ async function fetchPowChallenge(
 ): Promise<PowChallenge> {
   const headers = buildSessionHeaders(session);
 
-  const resp = await fetch(hostUrl("/api/v0/chat/create_pow_challenge"), {
+  const resp = await httpFetch(hostUrl("/api/v0/chat/create_pow_challenge"), {
     method: "POST",
     headers,
     body: JSON.stringify({ target_path: targetPath }),
@@ -1075,7 +1140,7 @@ export async function chatCompletion(
     body.model_type = request.model_type;
   }
 
-  const resp = await fetch(hostUrl("/api/v0/chat/completion"), {
+  const resp = await httpFetch(hostUrl("/api/v0/chat/completion"), {
     method: "POST",
     headers,
     body: JSON.stringify(body),
