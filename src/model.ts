@@ -50,6 +50,10 @@ export type ModelOptions = {
   searchEnabled?: boolean;
   timeoutMs?: number;
   chatSessionId?: string;
+  /** Called when the client has to make a non-obvious recovery decision
+   *  (e.g. the DeepSeek session was lost and the conversation was replayed
+   *  into a new one). The CLI surfaces this so it is never silent. */
+  onNotice?: (message: string) => void;
 };
 
 export class ModelError extends Error {
@@ -63,6 +67,34 @@ export class ModelError extends Error {
 }
 
 const DEFAULT_TIMEOUT_MS = 300_000;
+
+/* ------------------------------------------------------------------ */
+/* Prompt text                                                         */
+/* ------------------------------------------------------------------ */
+
+/** Local role definition. DeepSeek never sees this verbatim: the operative
+ *  header is TOOL_USAGE_INSTRUCTIONS, sent at the start of a chat session. */
+export const SYSTEM_PROMPT = `You are a command-line AI agent powered by DeepSeek. You work on the user's computer through one tool: shell — run any command in the working directory; you get back exitCode, stdout, stderr.
+
+Use shell to inspect the system, create and edit files, install and run programs, and verify results. Always actually do the work — never just explain how.
+
+To call the tool, output ONLY this JSON and nothing else:
+{"tool_calls":[{"id":"1","type":"function","function":{"name":"shell","arguments":{"command":"ls -la"}}}]}
+
+RULES:
+- Work step by step: run a command, read its output, then decide the next command.
+- Never claim something worked unless the tool result confirmed it. If a command fails, inspect the error and try another approach.
+- When the task is complete, reply with a short final answer as plain text.`;
+
+/** The tool rules the model actually reads. Sent at the start of every
+ *  DeepSeek chat session (first turn, and whenever a session has to be
+ *  re-seeded) so the agent never runs without its header. */
+export const TOOL_USAGE_INSTRUCTIONS = `Do real work with your shell tool. Whenever an action is needed, output ONLY this JSON (nothing else):
+{"tool_calls":[{"id":"1","type":"function","function":{"name":"shell","arguments":{"command":"COMMAND"}}}]}
+Tool results come back as {"exitCode":...,"stdout":...,"stderr":...}. Read them, then continue or finish.`;
+
+/** One-line reminder prepended to later turns of the same session. */
+export const TOOL_REMINDER = `Do real work with your shell tool: output the {"tool_calls":[...]} JSON when an action is needed.`;
 
 function parseToolCalls(assistant: unknown): ToolCallList {
   if (!assistant || typeof assistant !== "object") return [];
@@ -343,6 +375,101 @@ export function extractToolCallsFromText(
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* Context restoration                                                 */
+/* ------------------------------------------------------------------ */
+
+const SEED_MAX_ENTRIES = 12;
+const SEED_ENTRY_CHARS = 500;
+const SEED_TOOL_CHARS = 700;
+
+function clipForContext(text: string, max: number): string {
+  const one = text.replace(/\r/g, "").trim();
+  return one.length <= max ? one : `${one.slice(0, max - 1)}\u2026`;
+}
+
+/** Remove the per-turn instruction prefixes so a replayed user turn reads
+ *  as the task the user actually typed. */
+function stripPromptPrefixes(content: string): string {
+  let out = content;
+  for (const prefix of [TOOL_USAGE_INSTRUCTIONS, TOOL_REMINDER]) {
+    if (out.startsWith(prefix)) out = out.slice(prefix.length);
+  }
+  return out.trim();
+}
+
+/** Assistant text without the hidden resume marker. */
+function withoutResumeMarker(content: string): string {
+  if (!content) return content;
+  if (!extractResumeMarker(content)) return content;
+  const lastNewline = content.lastIndexOf("\n");
+  return lastNewline === -1 ? "" : content.slice(0, lastNewline).trimEnd();
+}
+
+function describeToolCalls(calls: ToolCallList): string[] {
+  const lines: string[] = [];
+  for (const call of calls) {
+    let command = "";
+    try {
+      const args = JSON.parse(call.function.arguments || "{}") as { command?: unknown };
+      if (typeof args?.command === "string") command = args.command;
+    } catch {
+      // keep the generic description
+    }
+    lines.push(
+      command
+        ? `used the shell tool: ${clipForContext(command, 300)}`
+        : `called the ${call.function.name} tool`,
+    );
+  }
+  return lines;
+}
+
+/**
+ * Replay an earlier conversation into a prompt. Used when the DeepSeek chat
+ * session behind a resumed conversation can no longer be continued: the new
+ * session has no history, so without this the model would lose both its tool
+ * rules and the work done so far.
+ */
+export function buildSessionSeed(
+  priorMessages: ChatMessage[],
+  currentPrompt: string,
+): string {
+  const entries: string[] = [];
+  for (const msg of priorMessages) {
+    if (msg.role === "system") continue;
+    const content = typeof msg.content === "string" ? msg.content : "";
+
+    if (msg.role === "user") {
+      const text = stripPromptPrefixes(content);
+      if (text) entries.push(`User: ${clipForContext(text, SEED_ENTRY_CHARS)}`);
+      continue;
+    }
+    if (msg.role === "assistant") {
+      if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+        for (const line of describeToolCalls(msg.tool_calls)) {
+          entries.push(`Assistant ${line}.`);
+        }
+      }
+      const text = withoutResumeMarker(content).trim();
+      if (text) entries.push(`Assistant: ${clipForContext(text, SEED_ENTRY_CHARS)}`);
+      continue;
+    }
+    if (msg.role === "tool" && content) {
+      entries.push(`Tool result: ${clipForContext(content, SEED_TOOL_CHARS)}`);
+    }
+  }
+
+  return [
+    TOOL_USAGE_INSTRUCTIONS,
+    "",
+    "You are continuing an existing session. Here is what happened earlier:",
+    ...entries.slice(-SEED_MAX_ENTRIES),
+    "",
+    currentPrompt,
+  ].join("\n");
+}
+
 export class Model {
   readonly session: DeepseekSession;
   readonly powWasmPath: string;
@@ -351,6 +478,7 @@ export class Model {
   readonly searchEnabled: boolean;
   private readonly timeoutMs: number;
   private readonly chatSessionId?: string;
+  private readonly onNotice?: (message: string) => void;
 
   constructor(options: ModelOptions) {
     this.session = options.session;
@@ -360,6 +488,7 @@ export class Model {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.chatSessionId = options.chatSessionId ?? undefined;
     this.powWasmPath = options.powWasmPath ?? resolvePowWasmPath();
+    this.onNotice = options.onNotice;
   }
 
   /** Lightweight session verification used at startup. */
@@ -374,30 +503,6 @@ export class Model {
     messages: ChatMessage[],
     tools: ToolDefinition[],
   ): Promise<ChatMessage> {
-    let chatSessionId = this.chatSessionId ?? "";
-    let parentMessageId = "";
-    let usedExistingSession = false;
-
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg.role === "assistant" && msg.content != null) {
-        const marker = extractResumeMarker(msg.content);
-        if (marker) {
-          chatSessionId = marker.chat_session_id;
-          parentMessageId = marker.message_id;
-          usedExistingSession = true;
-        }
-        break;
-      }
-    }
-
-    if (!chatSessionId) {
-      chatSessionId = await createChatSession(this.session);
-      parentMessageId = "";
-    } else if (!usedExistingSession && this.chatSessionId) {
-      usedExistingSession = true;
-    }
-
     const lastUserIdx = messages.reduce<number>((best, msg, idx) => {
       if (msg.role === "user" && idx > best) return idx;
       return best;
@@ -409,6 +514,43 @@ export class Model {
     if (typeof userPrompt !== "string" || userPrompt.trim() === "") {
       throw new ModelError("No user prompt found in the current conversation.");
     }
+
+    // Resolve the DeepSeek chat session to continue. The linkage lives in a
+    // resume marker on the last assistant message. When it is missing (an
+    // older session file, a lost message id, a chat deleted on the web side)
+    // we must never silently send a context-free prompt into a brand-new
+    // session — that is how a resumed conversation loses its rules and its
+    // whole history. Instead the new session gets re-seeded below.
+    let chatSessionId = this.chatSessionId ?? "";
+    let parentMessageId = "";
+    let linkageLost = false;
+
+    let lastAssistant: ChatMessage | undefined;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "assistant") {
+        lastAssistant = messages[i];
+        break;
+      }
+    }
+
+    const marker = lastAssistant
+      ? extractResumeMarker(lastAssistant.content ?? "")
+      : null;
+    if (marker) {
+      chatSessionId = marker.chat_session_id;
+      parentMessageId = marker.message_id;
+    } else if (!chatSessionId) {
+      chatSessionId = await createChatSession(this.session);
+      parentMessageId = "";
+      linkageLost = true;
+    }
+
+    // Everything that happened before this turn, used to re-seed a lost
+    // session so the model keeps both its tool rules and its context.
+    const priorMessages = messages.slice(0, Math.max(lastUserIdx, 0));
+    const hasPriorContext = priorMessages.some(
+      (m) => m.role === "user" || m.role === "assistant" || m.role === "tool",
+    );
 
     // Build the prompt to send. After tool results, include them so the
     // model can decide whether to continue calling tools or give a final
@@ -429,6 +571,17 @@ export class Model {
         "\n\nContinue working on the task. Use more tools if you need more " +
         "information or actions. When the task is fully complete, respond " +
         "with your final answer as plain text.";
+    }
+
+    // The DeepSeek session had to be restarted while the local conversation
+    // already had history: replay the header + earlier turns so the model is
+    // not left staring at a context-free prompt in an empty session.
+    if (linkageLost && hasPriorContext) {
+      promptToSend = buildSessionSeed(priorMessages, promptToSend);
+      this.onNotice?.(
+        "Could not continue the previous DeepSeek session — restored this " +
+          "conversation's header and history into a new one.",
+      );
     }
 
     const result = await runChat(

@@ -5,24 +5,18 @@
  *                          → no → return final answer
  */
 
-import { ModelError, type ChatMessage, type Model, type ToolDefinition } from "./model.js";
+import {
+  ModelError,
+  SYSTEM_PROMPT,
+  TOOL_REMINDER,
+  TOOL_USAGE_INSTRUCTIONS,
+  type ChatMessage,
+  type Model,
+  type ToolDefinition,
+} from "./model.js";
 import type { Tool } from "./tools.js";
 
-export const SYSTEM_PROMPT = `You are a command-line AI agent powered by DeepSeek. You work on the user's computer through one tool: shell — run any command in the working directory; you get back exitCode, stdout, stderr.
-
-Use shell to inspect the system, create and edit files, install and run programs, and verify results. Always actually do the work — never just explain how.
-
-To call the tool, output ONLY this JSON and nothing else:
-{"tool_calls":[{"id":"1","type":"function","function":{"name":"shell","arguments":{"command":"ls -la"}}}]}
-
-RULES:
-- Work step by step: run a command, read its output, then decide the next command.
-- Never claim something worked unless the tool result confirmed it. If a command fails, inspect the error and try another approach.
-- When the task is complete, reply with a short final answer as plain text.`;
-
-const TOOL_USAGE_INSTRUCTIONS = `Do real work with your shell tool. Whenever an action is needed, output ONLY this JSON (nothing else):
-{"tool_calls":[{"id":"1","type":"function","function":{"name":"shell","arguments":{"command":"COMMAND"}}}]}
-Tool results come back as {"exitCode":...,"stdout":...,"stderr":...}. Read them, then continue or finish.`;
+export { SYSTEM_PROMPT };
 
 const MAX_UNPARSEABLE_TOOL_CALL_RETRIES = 3;
 
@@ -166,9 +160,7 @@ export class Agent {
     if (isFirstTurn) {
       userContent = TOOL_USAGE_INSTRUCTIONS + "\n\n" + task;
     } else {
-      userContent =
-        "Do real work with your shell tool: output the {\"tool_calls\":[...]} JSON when an action is needed.\n\n" +
-        task;
+      userContent = TOOL_REMINDER + "\n\n" + task;
     }
     this.messages.push({ role: "user", content: userContent });
 

@@ -846,12 +846,16 @@ export async function chatCompletion(
   //   {v: ", world"}                                       — append to current field
   //   {p: "response/status", v: "FINISHED"}               — set status
   let activeField = "";
+  let currentEvent = "";
 
   const handleLine = (line: string): void => {
     const trimmed = line.trim();
     if (trimmed === "" || trimmed.startsWith(":")) return;
 
-    if (trimmed.startsWith("event:")) return;
+    if (trimmed.startsWith("event:")) {
+      currentEvent = trimmed.slice(6).trim();
+      return;
+    }
 
     if (trimmed.startsWith("data:")) {
       const payloadText = trimmed.slice(5).trim();
@@ -865,6 +869,19 @@ export async function chatCompletion(
       }
 
       const p = payload as Record<string, unknown>;
+
+      // The `ready` event carries the assistant message id directly:
+      //   event: ready
+      //   data: {"request_message_id":1,"response_message_id":2,...}
+      // It is the most reliable source of the id, and the resume marker
+      // depends on it — a missed id silently breaks session continuity.
+      if (currentEvent === "ready" && p.response_message_id != null) {
+        const rid = p.response_message_id;
+        if (typeof rid === "number" || (typeof rid === "string" && rid !== "")) {
+          messageId = String(rid);
+        }
+      }
+      currentEvent = "";
 
       // Update the active field pointer if present.
       if (typeof p.p === "string") {
@@ -882,7 +899,9 @@ export async function chatCompletion(
           const initialContent = resp.content;
           if (typeof initialContent === "string") fullText = initialContent;
           const mid = resp.message_id;
-          if (typeof mid === "number") messageId = String(mid);
+          if (typeof mid === "number" || (typeof mid === "string" && mid !== "")) {
+            messageId = String(mid);
+          }
         }
       }
 
@@ -894,8 +913,11 @@ export async function chatCompletion(
         // thinking_content and other fields are intentionally ignored for now.
       }
 
-      // Handle numeric values.
-      if (typeof val === "number" && activeField === "response/message_id") {
+      // Handle explicit message id assignments (number or string).
+      if (
+        (typeof val === "number" || (typeof val === "string" && val !== "")) &&
+        activeField === "response/message_id"
+      ) {
         messageId = String(val);
       }
 

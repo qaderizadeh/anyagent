@@ -107,7 +107,17 @@ Done. Created hello.txt.
 ```
 
 Every conversation is saved under `~/.anyagent/sessions/` after each turn, so you
-can quit and resume later with `--resume` or the startup picker. Commands:
+can quit and resume later with `--resume` or the startup picker.
+
+The DeepSeek side of a conversation lives on `chat.deepseek.com`, not in the
+session file: each saved session remembers which DeepSeek chat it belongs to and
+continues that same chat. If that chat can no longer be continued (an old session
+file, a chat deleted on the web side, an expired link), AnyAgent does **not**
+start a blank chat: it replays the tool rules and a compact recap of the earlier
+turns into a new DeepSeek session and tells you it did so. You keep your context
+instead of getting a context-free reply.
+
+Commands:
 
 ```
 /help      show help

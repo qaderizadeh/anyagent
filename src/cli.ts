@@ -185,6 +185,7 @@ function modelFromSession(session: DeepseekSession): Model {
     modelType: process.env["DEEPSEEK_MODEL_TYPE"] || undefined,
     thinkingEnabled: envBool("DEEPSEEK_THINKING_ENABLED", true),
     searchEnabled: envBool("DEEPSEEK_SEARCH_ENABLED", false),
+    onNotice: (message) => console.error(dim(`  ! ${message}`)),
   });
 }
 
