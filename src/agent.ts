@@ -48,8 +48,12 @@ export type AgentOptions = {
   messages?: ChatMessage[];
   /** Called before a tool executes. `args` is undefined when arguments failed to parse. */
   onToolCallStart?: (name: string, args?: Record<string, unknown>) => void;
-  /** Called after a tool execution attempt. */
-  onToolCallFinish?: (name: string, ok: boolean) => void;
+  /**
+   * Called after a tool execution attempt. `result` is the tool's own
+   * result (or the error object) so the caller can report what actually
+   * happened — e.g. a timed-out command is not a success.
+   */
+  onToolCallFinish?: (name: string, ok: boolean, result?: unknown) => void;
 };
 
 /** Strip the resume marker from assistant text before returning to the user. */
@@ -101,7 +105,7 @@ export class Agent {
   private readonly cwd: string;
   private readonly maxIterations: number;
   private readonly onToolCallStart?: (name: string, args?: Record<string, unknown>) => void;
-  private readonly onToolCallFinish?: (name: string, ok: boolean) => void;
+  private readonly onToolCallFinish?: (name: string, ok: boolean, result?: unknown) => void;
 
   constructor(options: AgentOptions) {
     this.model = options.model;
@@ -260,7 +264,7 @@ export class Agent {
           this.onToolCallStart?.(name);
         }
 
-        this.onToolCallFinish?.(name, ok);
+        this.onToolCallFinish?.(name, ok, result);
         this.messages.push({
           role: "tool",
           tool_call_id: callId,

@@ -23,7 +23,7 @@ import {
   resolvePowWasmPath,
   type DeepseekSession,
 } from "./deepseek.js";
-import { tools } from "./tools.js";
+import { abortActiveCommand, tools } from "./tools.js";
 import {
   listSessions,
   loadSessionData,
@@ -38,7 +38,10 @@ const HELP_TEXT = `Commands:
   /sessions  list saved sessions and switch to one
   /new       start a brand-new session
   /clear     forget the current conversation
-  /exit      quit
+  /exit      quit (also: Ctrl+C, Ctrl+D)
+
+While a task is running, Ctrl+C stops the current shell command and keeps
+ the session alive, so the agent can see what failed and try again.
 
 Usage:
   anyagent                 start an interactive session
@@ -105,12 +108,37 @@ function envBool(name: string, fallback: boolean): boolean {
   return fallback;
 }
 
+/** Keep activity lines readable: one line, and not absurdly long. */
+const MAX_PREVIEW_CHARS = 200;
+
+function preview(text: string): string {
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  return oneLine.length > MAX_PREVIEW_CHARS
+    ? `${oneLine.slice(0, MAX_PREVIEW_CHARS - 1)}…`
+    : oneLine;
+}
+
 /** Short human label for a tool call, used in activity lines. */
 function describeToolCall(name: string, args?: Record<string, unknown>): string {
-  if (name === "shell" && args?.command != null) return String(args.command);
+  if (name === "shell" && args?.command != null) return preview(String(args.command));
   if (!args) return "";
-  const raw = JSON.stringify(args);
-  return raw.length > 100 ? `${raw.slice(0, 100)}…` : raw;
+  return preview(JSON.stringify(args));
+}
+
+/**
+ * Render the outcome of a tool call. A command that timed out, was
+ * interrupted, or exited non-zero is a failure — even though the tool
+ * itself returned normally (the model gets to decide what to do next).
+ */
+function describeToolOutcome(ok: boolean, result?: unknown): { failed: boolean; note: string } {
+  if (!ok) return { failed: true, note: "" };
+  const r = (result ?? {}) as { exitCode?: unknown; timedOut?: unknown; interrupted?: unknown };
+  if (r.interrupted === true) return { failed: true, note: dim(" (interrupted)") };
+  if (r.timedOut === true) return { failed: true, note: dim(" (timed out)") };
+  if (typeof r.exitCode === "number" && r.exitCode !== 0) {
+    return { failed: true, note: dim(` (exit ${r.exitCode})`) };
+  }
+  return { failed: false, note: "" };
 }
 
 function printBanner(model: Model, cwd: string): void {
@@ -143,8 +171,9 @@ function makeAgent(
       const label = describeToolCall(name, args);
       console.error(`  ${dim("→")} ${dim(`${name}${label ? `: ${label}` : ""}`)}`);
     },
-    onToolCallFinish: (name, ok) => {
-      console.error(`  ${ok ? green("✓") : red("✗")} ${name}`);
+    onToolCallFinish: (name, ok, result) => {
+      const { failed, note } = describeToolOutcome(ok, result);
+      console.error(`  ${failed ? red("✗") : green("✓")} ${name}${note}`);
     },
   });
 }
@@ -297,6 +326,47 @@ async function runInteractive(
     });
   };
 
+  // Exit cleanly, killing whatever shell command is still running so we
+  // never leave orphaned processes behind.
+  const shutdown = (code: number, reason: string): void => {
+    abortActiveCommand();
+    rl.close();
+    console.log();
+    console.log(`Bye.${dim(` (${reason})`)}`);
+    process.exit(code);
+  };
+
+  // Register signal handling before anything can block on input (session
+  // loading, the session picker). With a TTY, readline owns the terminal:
+  // Ctrl+C arrives as 'SIGINT' on the interface, never as a process signal,
+  // and with no listener readline silently pauses input — so the interface
+  // listener has to exist from the very first prompt.
+  //
+  // Ctrl+C stops the command that is running, if any, and the session stays
+  // alive so the model can see the failure and try something else. At the
+  // prompt it quits.
+  rl.on("SIGINT", () => {
+    if (abortActiveCommand()) {
+      console.error();
+      console.error(dim("  ■ stopped the running command (Ctrl+C again to quit)"));
+      return;
+    }
+    shutdown(130, "Ctrl+C");
+  });
+
+  // Piped input (no TTY) delivers a real process signal instead.
+  process.on("SIGINT", () => shutdown(130, "SIGINT"));
+  process.on("SIGTERM", () => shutdown(143, "SIGTERM"));
+  process.on("SIGHUP", () => shutdown(129, "SIGHUP"));
+  process.on("uncaughtException", (error) => {
+    console.error(red(error instanceof Error ? error.message : String(error)));
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (reason) => {
+    console.error(red(reason instanceof Error ? reason.message : String(reason)));
+    process.exit(1);
+  });
+
   // Pick which session to start with (unless --resume/--session said so).
   let state: SessionState;
   let agent: Agent;
@@ -335,27 +405,6 @@ async function runInteractive(
     startNew();
   }
   console.log();
-
-  process.on("SIGINT", () => {
-    rl.close();
-    console.log();
-    console.log("Bye.");
-    process.exit(130);
-  });
-  process.on("SIGTERM", () => {
-    rl.close();
-    console.log();
-    console.log("Bye.");
-    process.exit(143);
-  });
-  process.on("uncaughtException", (error) => {
-    console.error(red(error instanceof Error ? error.message : String(error)));
-    process.exit(1);
-  });
-  process.on("unhandledRejection", (reason) => {
-    console.error(red(reason instanceof Error ? reason.message : String(reason)));
-    process.exit(1);
-  });
 
   const persist = async (): Promise<void> => {
     try {

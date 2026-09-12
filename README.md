@@ -114,8 +114,12 @@ can quit and resume later with `--resume` or the startup picker. Commands:
 /sessions  list saved sessions and switch to one
 /new       start a brand-new session
 /clear     forget the current conversation
-/exit      quit
+/exit      quit (also: Ctrl+C, Ctrl+D)
 ```
+
+While a task is running, **Ctrl+C stops the current shell command** (the model is
+told it was interrupted and can try something else) and the session stays alive.
+Press Ctrl+C again at the prompt, or type `/exit`, to quit.
 
 ## Environment variables
 
@@ -140,10 +144,17 @@ directory; returns `{exitCode, stdout, stderr}`. It works on any OS: Node picks
 inspect the system, create and edit files, install and run programs, verify
 results — goes through shell commands, so the tool surface stays minimal.
 
+Commands are non-interactive: stdin is empty, so anything that would prompt
+(an `ssh` passphrase, a pager, `npm login`) gets EOF instead of hanging until the
+timeout.
+
 Long-running commands (servers, watchers) are killed after the shell timeout; the
 whole descendant tree is killed (Linux/macOS: `/proc` + `pgrep` walk, Windows:
-`taskkill /T /F`) so the agent can never wedge on a leaked process. Tool failures
-never crash the agent — they are returned to the model as
+`taskkill /T /F`) so the agent can never wedge on a leaked process. A killed
+command comes back marked, e.g.
+`{"exitCode": -1, "timedOut": true, "stderr": "..."}` or `"interrupted": true`
+for Ctrl+C, and the CLI shows those as `✗` rather than a misleading `✓`.
+Tool failures never crash the agent — they are returned to the model as
 `{"error": true, "message": ...}` so DeepSeek can react and try another approach.
 
 ## Refreshing the PoW binary
