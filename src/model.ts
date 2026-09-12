@@ -477,8 +477,18 @@ export class Model {
   readonly thinkingEnabled: boolean;
   readonly searchEnabled: boolean;
   private readonly timeoutMs: number;
-  private readonly chatSessionId?: string;
   private readonly onNotice?: (message: string) => void;
+
+  /**
+   * The DeepSeek chat session this conversation is currently using, and the
+   * last assistant message id we know in it. Cached across calls so a lost
+   * message id (a stream that never reports one) can never make the agent
+   * create a brand-new session on every single step.
+   */
+  private activeChatSessionId?: string;
+  private activeMessageId?: string;
+  /** The "restored the conversation" notice is shown once per conversation. */
+  private reseedNoticeShown = false;
 
   constructor(options: ModelOptions) {
     this.session = options.session;
@@ -486,9 +496,20 @@ export class Model {
     this.thinkingEnabled = options.thinkingEnabled ?? true;
     this.searchEnabled = options.searchEnabled ?? false;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.chatSessionId = options.chatSessionId ?? undefined;
+    this.activeChatSessionId = options.chatSessionId ?? undefined;
     this.powWasmPath = options.powWasmPath ?? resolvePowWasmPath();
     this.onNotice = options.onNotice;
+  }
+
+  /**
+   * Forget the DeepSeek-side session linkage. Call this when the conversation
+   * changes (new session, switching sessions, /clear) so a cached session from
+   * the previous conversation is never reused for a different one.
+   */
+  resetLinkage(): void {
+    this.activeChatSessionId = undefined;
+    this.activeMessageId = undefined;
+    this.reseedNoticeShown = false;
   }
 
   /** Lightweight session verification used at startup. */
@@ -521,9 +542,8 @@ export class Model {
     // we must never silently send a context-free prompt into a brand-new
     // session — that is how a resumed conversation loses its rules and its
     // whole history. Instead the new session gets re-seeded below.
-    let chatSessionId = this.chatSessionId ?? "";
+    let chatSessionId = "";
     let parentMessageId = "";
-    let linkageLost = false;
 
     let lastAssistant: ChatMessage | undefined;
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -539,10 +559,16 @@ export class Model {
     if (marker) {
       chatSessionId = marker.chat_session_id;
       parentMessageId = marker.message_id;
-    } else if (!chatSessionId) {
+    } else if (this.activeChatSessionId) {
+      // The conversation already has a session: keep using it. A missing
+      // message id means we cannot continue the branch, but it must never
+      // cause a brand-new session per step (that used to loop forever,
+      // replaying the history and reprinting the notice every iteration).
+      chatSessionId = this.activeChatSessionId;
+      parentMessageId = this.activeMessageId ?? "";
+    } else {
       chatSessionId = await createChatSession(this.session);
       parentMessageId = "";
-      linkageLost = true;
     }
 
     // Everything that happened before this turn, used to re-seed a lost
@@ -573,15 +599,20 @@ export class Model {
         "with your final answer as plain text.";
     }
 
-    // The DeepSeek session had to be restarted while the local conversation
-    // already had history: replay the header + earlier turns so the model is
-    // not left staring at a context-free prompt in an empty session.
-    if (linkageLost && hasPriorContext) {
+    // Without a parent message id there is no branch to continue, so the
+    // prompt would land in the session with no memory. Replay the header and
+    // earlier turns. This can repeat across steps (each prompt then carries
+    // its own context), but the session is reused rather than recreated and
+    // the user-facing notice is shown only once.
+    if (parentMessageId === "" && hasPriorContext) {
       promptToSend = buildSessionSeed(priorMessages, promptToSend);
-      this.onNotice?.(
-        "Could not continue the previous DeepSeek session — restored this " +
-          "conversation's header and history into a new one.",
-      );
+      if (!this.reseedNoticeShown) {
+        this.reseedNoticeShown = true;
+        this.onNotice?.(
+          "Could not continue the previous DeepSeek session — restored this " +
+            "conversation's header and history into a new one.",
+        );
+      }
     }
 
     const result = await runChat(
@@ -597,6 +628,11 @@ export class Model {
       },
       this.powWasmPath,
     );
+
+    // Remember the session and message id for the next step of this
+    // conversation, regardless of whether the marker round-trips.
+    this.activeChatSessionId = chatSessionId;
+    if (result.message_id) this.activeMessageId = result.message_id;
 
     const text = typeof result.text === "string" ? result.text : "";
 

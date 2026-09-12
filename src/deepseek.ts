@@ -17,11 +17,35 @@ import * as fs from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 
+/** The normalized session the rest of the code works with. */
 export type DeepseekSession = {
   token: string;
   cookies: Record<string, string>;
   user_agent: string;
   client_headers?: Record<string, string>;
+};
+
+/**
+ * What a session file (or DEEPSEEK_SESSION_JSON) may contain.
+ *
+ * The simplest capture is the two headers of any chat.deepseek.com request
+ * (e.g. POST /api/v0/chat/create_pow_challenge in the browser's network tab):
+ *
+ *   { "authorization": "Bearer eyJ...", "cookie": "ds_session_id=...; ..." }
+ *
+ * `token` is accepted as an alias for `authorization`, and `cookies` for
+ * `cookie`, so header-style and older token-plus-map files both keep working.
+ * `cookies` may itself be a name→value map instead of a raw header string.
+ */
+export type DeepseekSessionInput = {
+  token?: string;
+  authorization?: string;
+  cookies?: Record<string, string> | string;
+  cookie?: string;
+  user_agent?: string;
+  client_headers?: Record<string, string>;
+  captured_at?: string | null;
+  max_age_ms?: number;
 };
 
 export type DeepseekSessionFile = DeepseekSession & {
@@ -43,17 +67,26 @@ export class DeepseekClientError extends Error {
   }
 }
 
-const DEFAULT_SESSION_MAX_AGE_MS = 6 * 60 * 60 * 1000; // 6 hours
+/**
+ * How long a captured session file is considered "fresh".
+ *
+ * This is only a hint for a warning: DeepSeek's web auth token lives far
+ * longer than the old 6-hour default (a session captured a day earlier still
+ * works). The backend is the real authority — if the token is actually dead,
+ * the verification/health request fails with a clear message. Keeping a very
+ * long window here avoids blocking startup for no reason.
+ */
+const DEFAULT_SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 function envPathOrJson(
   pathEnv: string,
   jsonEnv: string,
   filePath: string,
-): DeepseekSessionFile | null {
+): DeepseekSessionInput | null {
   const jsonEnvValue = process.env[jsonEnv];
   if (jsonEnvValue != null && jsonEnvValue.trim() !== "") {
     try {
-      return JSON.parse(jsonEnvValue) as DeepseekSessionFile;
+      return JSON.parse(jsonEnvValue) as DeepseekSessionInput;
     } catch {
       throw new DeepseekClientError(
         "invalid-session",
@@ -68,7 +101,7 @@ function envPathOrJson(
     try {
       const raw = fs.readFileSync(candidate, "utf8");
       if (raw.trim() === "") return null;
-      return JSON.parse(raw) as DeepseekSessionFile;
+      return JSON.parse(raw) as DeepseekSessionInput;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new DeepseekClientError(
@@ -81,7 +114,7 @@ function envPathOrJson(
   try {
     const raw = fs.readFileSync(filePath, "utf8");
     if (raw.trim() === "") return null;
-    return JSON.parse(raw) as DeepseekSessionFile;
+    return JSON.parse(raw) as DeepseekSessionInput;
   } catch {
     return null;
   }
@@ -112,28 +145,27 @@ export function describeSessionIssue(raw: DeepseekError): string {
       "You can also paste it inline via DEEPSEEK_SESSION_JSON or point at\n" +
       "any file with DEEPSEEK_SESSION_PATH.\n" +
       "\n" +
-      "Expected shape:\n" +
+      "Simplest shape - copy the two request headers from your browser:\n" +
       JSON.stringify(
         {
-          token: "your-session-token",
-          cookies: { ds_session_id: "...", other_cookie: "..." },
-          user_agent: "Mozilla/5.0 ... Chrome/... Safari/537.36",
-          client_headers: { "x-app-version": "2.0.0", "x-client-version": "2.0.0" },
+          authorization: "Bearer <your token>",
+          cookie: "ds_session_id=<...>; ...",
+          user_agent: "Mozilla/5.0 ... Firefox/... Safari/...",
           captured_at: new Date().toISOString(),
-          max_age_ms: DEFAULT_SESSION_MAX_AGE_MS,
         },
         null,
         2,
       ) +
       "\n" +
+      "The older form is still accepted: a \"token\" plus a \"cookies\" map.\n" +
       "\n" +
       "How to create one:\n" +
-      "1. Open https://chat.deepseek.com in your browser.\n" +
-      "2. Sign in once if you are not signed in.\n" +
-      "3. Open the browser developer console on that page.\n" +
-      "4. Run a small console snippet that reads your token and cookies,\n" +
-      "   then copy the printed JSON.\n" +
-      "5. Paste it into the session file, or run again with the JSON in\n" +
+      "1. Open https://chat.deepseek.com and sign in.\n" +
+      "2. Open DevTools -> Network and click any request to /api/v0/...\n" +
+      "   (create_pow_challenge is a good pick).\n" +
+      "3. Under Request Headers, copy the values of `authorization` and\n" +
+      "   `cookie` into the file above. The rest is optional.\n" +
+      "4. Paste it into the session file, or run again with the JSON in\n" +
       "   DEEPSEEK_SESSION_JSON.\n" +
       "\n" +
       raw.message
@@ -141,6 +173,12 @@ export function describeSessionIssue(raw: DeepseekError): string {
   }
 
   if (raw.type === "backend-error") {
+    // The completion-body helper already yields a complete, actionable
+    // message for application-level failures (a mute is not a session or
+    // transport problem, so the generic advice below would be misleading).
+    if (/DeepSeek has muted this account|DeepSeek rejected/.test(raw.message)) {
+      return raw.message;
+    }
     return (
       "chat.deepseek.com did not behave as expected.\n" +
       "\n" +
@@ -193,6 +231,29 @@ export function describeSessionIssue(raw: DeepseekError): string {
   );
 }
 
+/**
+ * The freshness window used for the (advisory) staleness warning.
+ *
+ * It is a property of the tool, not of the capture file: older files carry a
+ * now-known-too-short 6-hour `max_age_ms` value, and honouring it would nag on
+ * every startup even though the token still works. Override with
+ * DEEPSEEK_SESSION_MAX_AGE_MS if you want a different window.
+ */
+function effectiveSessionMaxAgeMs(): number {
+  const raw = process.env["DEEPSEEK_SESSION_MAX_AGE_MS"];
+  if (raw != null && raw.trim() !== "") {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return DEFAULT_SESSION_MAX_AGE_MS;
+}
+
+function formatDuration(ms: number): string {
+  if (ms >= 86_400_000) return `${(ms / 86_400_000).toFixed(1)} days`;
+  if (ms >= 3_600_000) return `${(ms / 3_600_000).toFixed(1)} hours`;
+  return `${Math.round(ms / 60_000)} minutes`;
+}
+
 export function sessionFreshnessOk(
   session: DeepseekSessionFile | null,
 ): boolean {
@@ -200,26 +261,129 @@ export function sessionFreshnessOk(
   const rawCaptured = session.captured_at;
   const captured = rawCaptured ? new Date(rawCaptured) : null;
   if (!captured || isNaN(captured.getTime())) return true;
-  const maxAge = session.max_age_ms ?? DEFAULT_SESSION_MAX_AGE_MS;
-  return Date.now() - captured.getTime() <= maxAge;
+  return Date.now() - captured.getTime() <= effectiveSessionMaxAgeMs();
 }
 
 /**
- * chat.deepseek.com now stores its auth token in localStorage wrapped as
- * {"value":"<token>","__version":"0"}. The API only accepts the inner
- * value in the Authorization header. Accept either form.
+ * A non-fatal warning when the session file is older than its freshness
+ * window. The agent keeps running either way: the backend decides whether
+ * the token still works. Returns null when there is nothing to say.
+ */
+export function sessionAgeWarning(
+  session: DeepseekSessionFile | null,
+): string | null {
+  if (!session) return null;
+  const captured = session.captured_at ? new Date(session.captured_at) : null;
+  if (!captured || isNaN(captured.getTime())) return null;
+  const maxAge = effectiveSessionMaxAgeMs();
+  const age = Date.now() - captured.getTime();
+  if (age <= maxAge) return null;
+  return (
+    `The saved DeepSeek session is ${formatDuration(age)} old (freshness window ` +
+    `${formatDuration(maxAge)}). Continuing anyway — if requests start failing, ` +
+    "re-capture it from chat.deepseek.com."
+  );
+}
+
+const BEARER_PREFIX = "Bearer ";
+
+const PLACEHOLDER_TOKEN = "your-session-token";
+
+const DEFAULT_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+/**
+ * Extract the bare token from any captured form:
+ *   - the raw value
+ *   - the localStorage wrapper {"value":"<token>","__version":"0"}
+ *   - a complete header value ("Bearer <token>")
+ *
+ * Idempotent, so saving a normalized session never doubles the prefix.
  */
 export function normalizeToken(raw: string): string {
-  if (raw == null || raw === "") return raw ?? "";
+  let value = (raw ?? "").trim();
+  const match = /^bearer\s+(.*)$/i.exec(value);
+  if (match) value = match[1].trim();
   try {
-    const parsed = JSON.parse(raw);
+    const parsed = JSON.parse(value);
     if (parsed && typeof parsed === "object" && typeof parsed.value === "string") {
       return parsed.value;
     }
   } catch {
     // not JSON — already the raw token
   }
-  return raw;
+  return value;
+}
+
+/** The full Authorization header value (empty string when there is no token). */
+export function normalizeAuthorization(raw: string): string {
+  const value = normalizeToken(raw);
+  return value === "" ? "" : `${BEARER_PREFIX}${value}`;
+}
+
+/**
+ * Build the Cookie header value from a captured cookie.
+ *
+ * Accepts a raw "ds_session_id=...; ..." header string (what you copy out of
+ * the browser's network tab) or a name→value map. A JSON-encoded map inside a
+ * string is also accepted.
+ */
+export function normalizeCookieHeader(raw: unknown): string {
+  if (raw == null) return "";
+
+  const fromMap = (map: Record<string, unknown>): string =>
+    Object.entries(map)
+      .filter(([key, value]) => key !== "" && value != null && String(value) !== "")
+      .map(([key, value]) => `${key}=${String(value)}`)
+      .join("; ");
+
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (trimmed === "") return "";
+    if (trimmed.startsWith("{")) {
+      try {
+        const parsed: unknown = JSON.parse(trimmed);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return fromMap(parsed as Record<string, unknown>);
+        }
+      } catch {
+        // Not JSON — treat it as a raw header value.
+      }
+    }
+    return trimmed;
+  }
+
+  if (typeof raw === "object" && !Array.isArray(raw)) {
+    return fromMap(raw as Record<string, unknown>);
+  }
+
+  return "";
+}
+
+/**
+ * Canonicalize any accepted session shape into the runtime form. This is what
+ * makes the simple "copy the authorization and cookie headers" file work.
+ */
+export function normalizeSession(raw: DeepseekSessionInput): DeepseekSessionFile {
+  const token = normalizeToken(raw.token ?? raw.authorization ?? "");
+  const cookie = normalizeCookieHeader(raw.cookies ?? raw.cookie ?? "");
+  const cookies: Record<string, string> = {};
+  for (const part of cookie.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx <= 0) continue;
+    const key = part.slice(0, idx).trim();
+    const value = part.slice(idx + 1).trim();
+    if (key !== "") cookies[key] = value;
+  }
+
+  return {
+    token,
+    cookies,
+    user_agent: (raw.user_agent ?? "").trim() || DEFAULT_USER_AGENT,
+    client_headers: raw.client_headers,
+    captured_at: raw.captured_at ?? null,
+    max_age_ms: raw.max_age_ms,
+  };
 }
 
 export function buildSessionHeaders(session: DeepseekSession): Record<string, string> {
@@ -231,15 +395,14 @@ export function buildSessionHeaders(session: DeepseekSession): Record<string, st
     "Content-Type": "application/json",
   };
 
-  if (session.token) {
-    headers["Authorization"] = `Bearer ${normalizeToken(session.token)}`;
+  const authorization = normalizeAuthorization(session.token ?? "");
+  if (authorization !== "") {
+    headers["Authorization"] = authorization;
   }
 
-  const cookieParts = Object.entries(session.cookies)
-    .map(([k, v]) => `${k}=${v}`)
-    .join("; ");
-  if (cookieParts) {
-    headers["Cookie"] = cookieParts;
+  const cookie = normalizeCookieHeader(session.cookies);
+  if (cookie !== "") {
+    headers["Cookie"] = cookie;
   }
 
   for (const [key, value] of Object.entries(session.client_headers ?? {})) {
@@ -268,43 +431,39 @@ export async function loadSession(): Promise<DeepseekSessionFile> {
     );
   }
 
-  if (!sessionFreshnessOk(raw)) {
-    throw new DeepseekClientError(
-      "invalid-session",
-      `Saved DeepSeek session may be too old.\n\n` +
-        describeSessionIssue({
-          type: "invalid-session",
-          message: `Session was captured at ${raw.captured_at ?? "unknown"}. ` +
-            `Refresh it by re-capturing from chat.deepseek.com.`,
-        }),
-    );
-  }
+  // Accept every capture style (raw header values, a cookie map, an
+  // Authorization value that already starts with "Bearer ") and canonicalize.
+  const session = normalizeSession(raw);
+
+  // A stale session file is not an error: DeepSeek tokens outlive the
+  // freshness window, so we warn (via sessionAgeWarning) and let the backend
+  // decide. Blocking startup here was a false negative in practice.
 
   // The shipped placeholder is not a real session: guide the user to
   // capture one instead of failing against the backend.
-  if (raw.token === "your-session-token") {
+  if (session.token === PLACEHOLDER_TOKEN) {
     throw new DeepseekClientError(
       "invalid-session",
       `The session file still contains the placeholder values.\n\n` +
         describeSessionIssue({
           type: "invalid-session",
-          message: "Replace the placeholder token and cookies with your real DeepSeek session.",
+          message: "Replace the placeholder authorization and cookie with your real DeepSeek session.",
         }),
     );
   }
 
-  if ((raw.token == null || raw.token === "") && Object.keys(raw.cookies ?? {}).length === 0) {
+  if (session.token === "" && Object.keys(session.cookies).length === 0) {
     throw new DeepseekClientError(
       "invalid-session",
-      `Session file exists but has no token or cookies.\n\n` +
+      `Session file exists but has no authorization or cookie.\n\n` +
         describeSessionIssue({
           type: "invalid-session",
-          message: "Fill in token and cookies in the session file.",
+          message: "Fill in the authorization and cookie values in the session file.",
         }),
     );
   }
 
-  return raw;
+  return session;
 }
 
 export async function verifySession(session: DeepseekSession): Promise<void> {
@@ -428,6 +587,63 @@ export async function lightHealthCheck(session: DeepseekSession): Promise<void> 
         }),
     );
   }
+}
+
+/**
+ * Turn a non-SSE JSON body from /chat/completion into a readable error.
+ *
+ * The endpoint normally streams SSE. When it instead returns a plain JSON
+ * envelope it is an application-level failure: the old code fed that body to
+ * the SSE parser, which found no events and returned an empty reply — so a
+ * blocked/muted account looked like a silent, empty model answer. Surface it
+ * instead.
+ */
+export function describeCompletionBody(body: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return `chat completion returned a non-streaming response: ${body.slice(0, 400)}`;
+  }
+
+  const root = parsed as {
+    code?: unknown;
+    msg?: unknown;
+    message?: unknown;
+    data?: unknown;
+  };
+  const data = (root.data ?? {}) as {
+    biz_code?: unknown;
+    biz_msg?: unknown;
+    biz_data?: { is_muted?: unknown; mute_until?: unknown };
+  };
+  const bizData = data.biz_data ?? {};
+  const bizCode = typeof data.biz_code === "number" ? data.biz_code : undefined;
+  const bizMsg =
+    typeof data.biz_msg === "string" && data.biz_msg !== "" ? data.biz_msg : undefined;
+
+  if (bizData.is_muted === 1 || bizData.is_muted === true) {
+    const until =
+      typeof bizData.mute_until === "number"
+        ? ` until ${new Date(bizData.mute_until * 1000).toISOString()}`
+        : "";
+    return (
+      `DeepSeek has muted this account${until} (biz_code ${bizCode ?? 5}: ${bizMsg ?? "user is muted"}).\n` +
+      "\n" +
+      "This is a DeepSeek-side restriction on automated use, not a bug in the agent.\n" +
+      "Wait for the mute to expire, and avoid firing many requests in a burst."
+    );
+  }
+
+  if (bizCode != null && bizCode !== 0) {
+    return `DeepSeek rejected the completion (biz_code ${bizCode}: ${bizMsg ?? "no message"}).`;
+  }
+  if (typeof root.code === "number" && root.code !== 0) {
+    const msg = typeof root.msg === "string" ? root.msg : "no message";
+    return `DeepSeek rejected the completion (code ${root.code}: ${msg}).`;
+  }
+
+  return `chat completion returned an unexpected non-streaming response: ${body.slice(0, 400)}`;
 }
 
 export type ChatRequest = {
@@ -824,6 +1040,16 @@ export async function chatCompletion(
     );
   }
 
+  // A streaming reply is text/event-stream. Anything else (notably a JSON
+  // envelope like {code:0,data:{biz_code:5,biz_msg:"user is muted"}}) is a
+  // backend-level failure that must be reported, never parsed as an empty
+  // stream of events.
+  const contentType = resp.headers.get("content-type") ?? "";
+  if (!contentType.includes("text/event-stream")) {
+    const body = await resp.text().catch(() => "");
+    throw new DeepseekClientError("backend-error", describeCompletionBody(body));
+  }
+
   const reader = resp.body?.getReader();
   if (!reader) {
     throw new DeepseekClientError(
@@ -869,6 +1095,17 @@ export async function chatCompletion(
       }
 
       const p = payload as Record<string, unknown>;
+
+      // Application-level failures can also arrive as an in-stream payload;
+      // never let one masquerade as an empty answer.
+      const pCode = p.code;
+      const pBizCode = p.biz_code;
+      if (
+        (typeof pCode === "number" && pCode !== 0) ||
+        (typeof pBizCode === "number" && pBizCode !== 0)
+      ) {
+        throw new DeepseekClientError("backend-error", describeCompletionBody(payloadText));
+      }
 
       // The `ready` event carries the assistant message id directly:
       //   event: ready

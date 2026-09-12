@@ -19,6 +19,9 @@ import type { Tool } from "./tools.js";
 export { SYSTEM_PROMPT };
 
 const MAX_UNPARSEABLE_TOOL_CALL_RETRIES = 3;
+/** Consecutive empty model replies before giving up (a rate-limited or
+ *  muted backend otherwise burns every iteration returning nothing). */
+const MAX_EMPTY_RESPONSES = 5;
 
 const UNPARSEABLE_TOOL_CALL_NUDGE = `Your previous message was a tool-call JSON block that could not be parsed. Do not explain it or apologize — just re-send the tool call as valid JSON on a single line, in exactly this shape:
 {"tool_calls":[{"id":"1","type":"function","function":{"name":"shell","arguments":{"command":"COMMAND"}}}]}
@@ -167,17 +170,29 @@ export class Agent {
     const definitions = Object.values(this.tools).map((tool) => tool.definition);
 
     let unparseableAttempts = 0;
+    let emptyAttempts = 0;
 
     for (let iteration = 0; iteration < this.maxIterations; iteration++) {
       const assistant = await this.chatWithRetry(definitions);
 
       const toolCalls = Array.isArray(assistant.tool_calls) ? assistant.tool_calls : [];
+      if (toolCalls.length > 0) emptyAttempts = 0;
       if (toolCalls.length === 0) {
         // Final answer.
         const text = typeof assistant.content === "string" ? assistant.content : "";
         const display = stripResumeMarker(text).trim();
         if (display === "") {
-          // The model returned empty — nudge it to give a final answer.
+          // The model returned empty — nudge it to give a final answer, but
+          // stop after a few tries instead of burning every iteration.
+          emptyAttempts++;
+          if (emptyAttempts > MAX_EMPTY_RESPONSES) {
+            return (
+              "Agent stopped: the model returned empty responses " +
+              `${MAX_EMPTY_RESPONSES + 1} times in a row. ` +
+              "The backend may be rate-limiting or muting this account — " +
+              "see the error above, then retry later."
+            );
+          }
           this.messages.push({ role: "assistant", content: text });
           this.messages.push({ role: "user", content: "Please provide your final answer now." });
           continue;
@@ -187,6 +202,7 @@ export class Agent {
         // the call, a bounded number of times, then fail honestly.
         if (looksLikeUnparsedToolCall(display)) {
           unparseableAttempts++;
+          emptyAttempts = 0;
           if (unparseableAttempts <= MAX_UNPARSEABLE_TOOL_CALL_RETRIES) {
             this.messages.push({ role: "assistant", content: text });
             this.messages.push({ role: "user", content: UNPARSEABLE_TOOL_CALL_NUDGE });

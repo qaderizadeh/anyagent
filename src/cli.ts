@@ -20,7 +20,9 @@ import { Agent } from "./agent.js";
 import { Model, ModelError, type ChatMessage } from "./model.js";
 import {
   loadSession,
+  normalizeSession,
   resolvePowWasmPath,
+  sessionAgeWarning,
   type DeepseekSession,
 } from "./deepseek.js";
 import { abortActiveCommand, tools } from "./tools.js";
@@ -52,6 +54,7 @@ Usage:
 
 Env:
   DEEPSEEK_SESSION_PATH / DEEPSEEK_SESSION_JSON   DeepSeek web session
+  DEEPSEEK_SESSION_MAX_AGE_MS  advisory session-file freshness window (default 30 days)
   DEEPSEEK_POW_WASM_PATH    path to sha3_wasm_bg.wasm (default ./sha3_wasm_bg.wasm)
   DEEPSEEK_MODEL_TYPE       e.g. deepseek-reasoner (default: backend default)
   DEEPSEEK_THINKING_ENABLED 1/true to enable deep thinking (default: enabled)
@@ -141,7 +144,7 @@ function describeToolOutcome(ok: boolean, result?: unknown): { failed: boolean; 
   return { failed: false, note: "" };
 }
 
-function printBanner(model: Model, cwd: string): void {
+function printBanner(model: Model, cwd: string, warning?: string): void {
   console.log(bold(cyan("AnyAgent")));
   console.log(dim("────────────────────────────"));
   console.log(`Backend:   chat.deepseek.com (direct, no API key)`);
@@ -149,6 +152,7 @@ function printBanner(model: Model, cwd: string): void {
   console.log(`Thinking:  ${model.thinkingEnabled ? green("enabled") : "disabled"}`);
   console.log(`Search:    ${model.searchEnabled ? green("enabled") : "disabled"}`);
   console.log(`Directory: ${cwd}`);
+  if (warning) console.log(yellow(`! ${warning}`));
   console.log();
   console.log(yellow("WARNING: this agent executes shell commands and can modify files."));
   console.log(yellow("Only run it in a directory/environment you trust."));
@@ -161,6 +165,9 @@ function makeAgent(
   maxIterations: number,
   messages?: ChatMessage[],
 ): Agent {
+  // A new Agent means a new conversation: never reuse the DeepSeek session
+  // cached for the previous one.
+  model.resetLinkage();
   return new Agent({
     model,
     tools,
@@ -298,9 +305,9 @@ async function runInteractive(
   model: Model,
   cwd: string,
   maxIterations: number,
-  opts: { resume: boolean; sessionId?: string },
+  opts: { resume: boolean; sessionId?: string; startupWarning?: string },
 ): Promise<number> {
-  printBanner(model, cwd);
+  printBanner(model, cwd, opts.startupWarning);
 
   // Create the readline interface up front and attach a line listener
   // immediately, so piped input (printf ... | anyagent) is never lost while
@@ -449,6 +456,7 @@ async function runInteractive(
     }
     if (input === "/clear") {
       agent.reset();
+      model.resetLinkage();
       console.log("Conversation cleared.");
       return false;
     }
@@ -530,14 +538,15 @@ async function main(): Promise<void> {
   await checkCwd(parsed.cwd);
 
   let session: DeepseekSession;
+  let sessionWarning: string | null = null;
   try {
     const loaded = await loadSession();
-    session = {
-      token: loaded.token ?? "",
-      cookies: loaded.cookies ?? {},
-      user_agent: loaded.user_agent ?? "",
-      client_headers: loaded.client_headers,
-    };
+    // Old session files are no longer fatal: DeepSeek tokens outlive the
+    // freshness window, so warn and let the backend verification decide.
+    sessionWarning = sessionAgeWarning(loaded);
+    // loadSession already canonicalizes; normalizing again is cheap and keeps
+    // this safe if a session is built from another source.
+    session = normalizeSession(loaded);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(red(message));
@@ -560,6 +569,7 @@ async function main(): Promise<void> {
   const maxIterations = envInt("DEEPSEEK_MAX_ITERATIONS", 50);
 
   if (parsed.task) {
+    if (sessionWarning) console.error(yellow(`! ${sessionWarning}`));
     const agent = makeAgent(model, parsed.cwd, maxIterations);
     const code = await runSingleTask(agent, model, parsed.task);
     if (code === 0) {
@@ -586,6 +596,7 @@ async function main(): Promise<void> {
   await runInteractive(model, parsed.cwd, maxIterations, {
     resume: parsed.resume,
     sessionId: parsed.sessionId,
+    startupWarning: sessionWarning ?? undefined,
   });
   process.exit(0);
 }

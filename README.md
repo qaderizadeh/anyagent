@@ -27,8 +27,8 @@ abstractions — the whole loop is readable in `src/agent.ts`.
 - The agent speaks the real DeepSeek web chat protocol:
   `POST /api/v0/chat_session/create`, `POST /api/v0/chat/create_pow_challenge`,
   and `POST /api/v0/chat/completion` (SSE), all against `https://chat.deepseek.com`.
-- Authentication is the session token + cookies from your signed-in browser,
-  pasted into a small JSON file. No API key is needed.
+- Authentication is two request headers (`authorization` and `cookie`) copied
+  from your signed-in browser into a small JSON file. No API key is needed.
 - The proof-of-work challenge is solved locally with the `sha3_wasm_bg.wasm`
   binary that the DeepSeek site itself loads (see "Refreshing the PoW binary").
 
@@ -47,24 +47,42 @@ npm run build
 Then capture a session once:
 
 1. Open https://chat.deepseek.com in your browser and sign in.
-2. Open the browser developer console (F12) on that page.
-3. Grab your session token and cookies. For example:
-   ```js
-   // token is usually under localStorage:
-   localStorage.getItem("userToken");
-   // cookies for the chat.deepseek.com domain:
-   document.cookie;
+2. Open DevTools → **Network** and click any request to `/api/v0/...`
+   (`create_pow_challenge` is a good pick).
+3. Under **Request Headers**, copy the values of `authorization` and `cookie`
+   and paste them into `DEEPSEEK_SESSION_JSON` (the file in this repo):
+   ```json
+   {
+     "authorization": "Bearer <the authorization header value>",
+     "cookie": "<the cookie header value>",
+     "user_agent": "Mozilla/5.0 ...",
+     "captured_at": "2026-09-12T08:44:15.868Z"
+   }
    ```
-4. Paste them into `DEEPSEEK_SESSION_JSON` (the file in this repo) — see the
-   placeholder for the exact shape. Keep it out of version control.
+   `user_agent` and `captured_at` are optional. Keep the file out of version
+   control.
+
+Behind the scenes the loader accepts a few shapes, so older or scripted
+captures keep working: `authorization` (or `token`) may be the bare token, the
+`{"value":"...","__version":"0"}` localStorage wrapper, or a full
+`Bearer ...` header value; `cookie` (or `cookies`) may be the raw header string
+or a name→value map. Everything is normalized before use.
 
 On startup the CLI checks that file (or `DEEPSEEK_SESSION_PATH` /
 `DEEPSEEK_SESSION_JSON` env), verifies the session by touching the backend, and:
 
 - if it works → straight to the prompt;
-- if it is missing/expired/rejected → clear instructions and exit.
+- if it is missing/invalid/rejected → clear instructions and exit.
 
-Sessions expire; when the CLI says so, repeat the capture and rerun.
+DeepSeek's web token lives much longer than a working day, so a session captured
+days or weeks ago usually still works. The file's `captured_at` is only used for
+a **non-fatal** heads-up: after 30 days the CLI prints a one-line note and
+continues — the backend is the real authority, and its verification request is
+what decides. Override the window with `DEEPSEEK_SESSION_MAX_AGE_MS` if you want
+a different one.
+
+Sessions do eventually expire; when the CLI says the backend rejected the
+session, repeat the capture and rerun.
 
 ## Usage
 
@@ -114,8 +132,13 @@ session file: each saved session remembers which DeepSeek chat it belongs to and
 continues that same chat. If that chat can no longer be continued (an old session
 file, a chat deleted on the web side, an expired link), AnyAgent does **not**
 start a blank chat: it replays the tool rules and a compact recap of the earlier
-turns into a new DeepSeek session and tells you it did so. You keep your context
-instead of getting a context-free reply.
+turns into a new DeepSeek session and tells you it did so — once, not on every
+step. You keep your context instead of getting a context-free reply.
+
+If DeepSeek returns an application-level error instead of a normal reply (for
+example `biz_code 5: user is muted` after too many requests in a burst), the agent
+reports it plainly and stops instead of looping. A mute is a DeepSeek-side limit
+on automated use: wait for it to expire, then retry — nothing needs re-capturing.
 
 Commands:
 
@@ -143,6 +166,7 @@ Press Ctrl+C again at the prompt, or type `/exit`, to quit.
 | `DEEPSEEK_THINKING_ENABLED` | `1` | Enable deep thinking (slower, more careful) |
 | `DEEPSEEK_SEARCH_ENABLED` | `0` | Let the model browse the web itself (off by default) |
 | `DEEPSEEK_MAX_ITERATIONS` | `50` | Safety cap on agent loop iterations |
+| `DEEPSEEK_SESSION_MAX_AGE_MS` | 30 days | Advisory freshness window for the session file |
 | `DEEPSEEK_SHELL_TIMEOUT_MS` | `120000` | Shell tool timeout |
 | `ANYAGENT_SESSIONS_DIR` | `~/.anyagent/sessions` | Where conversation history is stored |
 
