@@ -340,42 +340,129 @@ function rebalanceJson(text: string): string {
 export function extractXmlToolCalls(
   text: string,
 ): { calls: ToolCallList; startIdx: number } | null {
-  const startMatch = /<tool_calls\b|<function_calls\b|<invoke\s+name\s*=\s*["']/i.exec(text);
+  // Replies arrive in several spellings of the same markup: plain tags, a
+  // stray backslash before closing tags (<\/invoke>), and fully JSON-escaped
+  // attributes (name=\"shell\"). The tag regexes tolerate an optional
+  // backslash so none of those need a separate pass.
+  const startMatch = /<tool_calls\b|<function_calls\b|<invoke\s+name\s*=/i.exec(text);
   if (!startMatch) return null;
   const startIdx = startMatch.index;
 
-  // Work on the tail only, so startIdx stays valid for the caller. Only the
-  // closing tags can carry the stray backslash.
-  const scope = text.slice(startIdx).replace(/<\\\//g, "</");
+  // Work on the tail only, so startIdx stays valid for the caller.
+  const scope = text.slice(startIdx);
+
+  const invokeRe =
+    /<invoke\s+name\s*=\s*\\?["']([^"'\\]+)\\?["'][^>]*>([\s\S]*?)(?:<\\?\/invoke\s*>|$)/gi;
 
   const calls: ToolCallList = [];
-  const invokeRe = /<invoke\s+name\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/invoke>/gi;
   for (const match of scope.matchAll(invokeRe)) {
     const name = (match[1] ?? "").trim();
     if (!name) continue;
     const body = match[2] ?? "";
-    const args: Record<string, string> = {};
+    const args: Record<string, unknown> = {};
 
     // <parameter name="k">value</parameter>
-    const elementRe = /<parameter\s+name\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/parameter>/gi;
+    const elementRe =
+      /<parameter\s+([^>]*?)>([\s\S]*?)<\\?\/parameter\s*>/gi;
     for (const param of body.matchAll(elementRe)) {
-      args[(param[1] ?? "").trim()] = (param[2] ?? "").trim();
+      const key = readXmlAttribute(param[1] ?? "", "name");
+      if (key) args[key] = coerceXmlParamValue(param[2] ?? "");
     }
-    // <parameter name="k" value="v" />
-    const attrRe = /<parameter\s+name\s*=\s*["']([^"']+)["'][^>]*\bvalue\s*=\s*["']([^"']*)["'][^>]*\/?>/gi;
+
+    // <parameter name="k" value="v" /> — an attribute value, as opposed to
+    // element text. Uses whatever the element pass did not already set.
+    const attrRe = /<parameter\s+([^>]*?)\/?>/gi;
     for (const param of body.matchAll(attrRe)) {
-      const key = (param[1] ?? "").trim();
-      if (!(key in args)) args[key] = param[2] ?? "";
+      const attrs = param[1] ?? "";
+      const key = readXmlAttribute(attrs, "name");
+      const value = readXmlAttribute(attrs, "value");
+      if (key && value != null && !(key in args)) {
+        args[key] = coerceXmlParamValue(value);
+      }
     }
 
     calls.push({
       id: String(calls.length + 1),
       type: "function",
-      function: { name, arguments: JSON.stringify(args) },
+      function: { name, arguments: JSON.stringify(normalizeXmlArguments(args)) },
     });
   }
 
   return calls.length > 0 ? { calls, startIdx } : null;
+}
+
+/** Read `attr="value"` from a tag's attribute text, tolerating a leading
+ *  backslash on the quotes (the JSON-escaped spelling). */
+function readXmlAttribute(attrs: string, attr: "name" | "value"): string | null {
+  const patterns = {
+    name: /(?:^|\s)name\s*=\s*\\?["']([^"'\\]*)\\?["']/i,
+    value: /(?:^|\s)value\s*=\s*\\?["']([^"'\\]*)\\?["']/i,
+  };
+  const match = patterns[attr].exec(attrs);
+  return match ? (match[1] ?? "") : null;
+}
+
+/**
+ * Parse JSON that may have been double-escaped because the whole reply was
+ * written inside a JSON string (`{\"command\": \"ls -la\"}`). The plain
+ * parse is always tried first, so a value that is already valid is never
+ * rewritten.
+ */
+function parseJsonLoose(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    // not the plain spelling; try the escaped one
+  }
+  try {
+    return JSON.parse(text.replace(/\\(["'\\/])/g, "$1"));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A parameter value is often JSON rather than plain text — `"ls -la"`,
+ * `{"command":"ls -la"}` — so decode it when it clearly is.
+ */
+function coerceXmlParamValue(raw: string): unknown {
+  const value = raw.trim();
+  const looksJson =
+    (value.startsWith("{") && value.endsWith("}")) ||
+    (value.startsWith("[") && value.endsWith("]")) ||
+    (value.startsWith('"') && value.endsWith('"'));
+  if (!looksJson) return value;
+  const parsed = parseJsonLoose(value);
+  return parsed === undefined ? value : parsed;
+}
+
+/**
+ * Models frequently wrap the whole argument object in a single parameter
+ * named `arguments` (or `args`) instead of naming each one:
+ *
+ *   <parameter name="arguments">{"command": "ls -la"}</parameter>
+ *
+ * Left alone, the tool would receive `{arguments: "{...}"}` and see no
+ * `command` at all. Unwrap it.
+ */
+function normalizeXmlArguments(args: Record<string, unknown>): Record<string, unknown> {
+  const keys = Object.keys(args);
+  if (keys.length !== 1) return args;
+
+  const only = keys[0];
+  if (only !== "arguments" && only !== "args" && only !== "parameters") return args;
+
+  const value = args[only];
+  if (value != null && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value === "string") {
+    const parsed = parseJsonLoose(value);
+    if (parsed != null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  }
+  return args;
 }
 
 /**
