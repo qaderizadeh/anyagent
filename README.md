@@ -135,6 +135,20 @@ start a blank chat: it replays the tool rules and a compact recap of the earlier
 turns into a new DeepSeek session and tells you it did so — once, not on every
 step. You keep your context instead of getting a context-free reply.
 
+The linkage can also go stale on the DeepSeek side, and that is recovered
+transparently too:
+
+- `biz_code 26: invalid message id` — the message a resumed turn points at no
+  longer exists (it usually came from a reply that never finished). The agent
+  continues in the **same** chat with no parent message and the header + history
+  replayed, and says so once.
+- `biz_code 1: invalid chat session id` — the chat itself is gone, so a fresh one
+  is created and re-seeded, exactly like the case above.
+
+Either way the conversation keeps working; a stale pointer can no longer make
+every future turn fail. The recovery is attempted **once** — if DeepSeek still
+refuses, the real error is shown instead of retrying forever.
+
 If DeepSeek returns an application-level error instead of a normal reply (for
 example `biz_code 5: user is muted` after too many requests in a burst), the agent
 reports it plainly and stops instead of looping. A mute is a DeepSeek-side limit

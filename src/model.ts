@@ -8,10 +8,14 @@
  */
 
 import {
+  BIZ_CODE_INVALID_CHAT_SESSION,
+  BIZ_CODE_INVALID_MESSAGE_ID,
+  DeepseekClientError,
   createChatSession,
   lightHealthCheck,
   resolvePowWasmPath,
   runChat,
+  type ChatResult,
   type DeepseekSession,
 } from "./deepseek.js";
 
@@ -502,6 +506,16 @@ export class Model {
   }
 
   /**
+   * Tell the user about a non-obvious recovery decision, at most once per
+   * conversation (otherwise a multi-step task repeats it every iteration).
+   */
+  private showLinkageNotice(message: string): void {
+    if (this.reseedNoticeShown) return;
+    this.reseedNoticeShown = true;
+    this.onNotice?.(message);
+  }
+
+  /**
    * Forget the DeepSeek-side session linkage. Call this when the conversation
    * changes (new session, switching sessions, /clear) so a cached session from
    * the previous conversation is never reused for a different one.
@@ -583,55 +597,48 @@ export class Model {
     // answer. We deliberately do NOT tell it to stop: multi-step tasks need
     // more tool calls after the first result. Iterations are bounded by the
     // agent's maxIterations instead.
-    let promptToSend = userPrompt;
-    const recentResults = messages
-      .slice(lastUserIdx + 1)
-      .filter((m) => m.role === "tool")
-      .map((m) => (typeof m.content === "string" ? m.content : "{}"));
-    if (recentResults.length > 0) {
-      promptToSend =
-        "Tool results:\n" +
-        recentResults.join("\n") +
-        "\n\nTask: " +
-        userPrompt +
-        "\n\nContinue working on the task. Use more tools if you need more " +
-        "information or actions. When the task is fully complete, respond " +
-        "with your final answer as plain text.";
-    }
-
+    const basePrompt = buildPrompt(userPrompt, messages, lastUserIdx);
     // Without a parent message id there is no branch to continue, so the
     // prompt would land in the session with no memory. Replay the header and
-    // earlier turns. This can repeat across steps (each prompt then carries
-    // its own context), but the session is reused rather than recreated and
-    // the user-facing notice is shown only once.
+    // earlier turns. The session is reused rather than recreated and the
+    // user-facing notice is shown only once.
+    const seededPrompt = hasPriorContext
+      ? buildSessionSeed(priorMessages, basePrompt)
+      : basePrompt;
+
     if (parentMessageId === "" && hasPriorContext) {
-      promptToSend = buildSessionSeed(priorMessages, promptToSend);
-      if (!this.reseedNoticeShown) {
-        this.reseedNoticeShown = true;
-        this.onNotice?.(
-          "Could not continue the previous DeepSeek session — restored this " +
-            "conversation's header and history into a new one.",
-        );
-      }
+      this.showLinkageNotice(LOST_SESSION_NOTICE);
     }
 
-    const result = await runChat(
-      this.session,
-      {
-        session: this.session,
-        chat_session_id: chatSessionId,
-        parent_message_id: parentMessageId || undefined,
-        prompt: promptToSend,
-        model_type: this.modelType,
-        thinking_enabled: this.thinkingEnabled,
-        search_enabled: this.searchEnabled,
-      },
-      this.powWasmPath,
+    // Send the turn. A stale session/parent linkage must never brick the
+    // conversation (see sendTurnWithRecovery).
+    const turn = await sendTurnWithRecovery(
+      { chatSessionId, parentMessageId, basePrompt, seededPrompt },
+      (request) =>
+        runChat(
+          this.session,
+          {
+            session: this.session,
+            chat_session_id: request.chat_session_id,
+            parent_message_id: request.parent_message_id,
+            prompt: request.prompt,
+            model_type: this.modelType,
+            thinking_enabled: this.thinkingEnabled,
+            search_enabled: this.searchEnabled,
+          },
+          this.powWasmPath,
+        ),
+      () => createChatSession(this.session),
+      (kind) =>
+        this.showLinkageNotice(
+          kind === "new-session" ? LOST_SESSION_NOTICE : LOST_PARENT_NOTICE,
+        ),
     );
+    const result = turn.result;
 
     // Remember the session and message id for the next step of this
     // conversation, regardless of whether the marker round-trips.
-    this.activeChatSessionId = chatSessionId;
+    this.activeChatSessionId = turn.chatSessionId;
     if (result.message_id) this.activeMessageId = result.message_id;
 
     const text = typeof result.text === "string" ? result.text : "";
@@ -657,15 +664,133 @@ export class Model {
       out.tool_calls = toolCalls;
     }
 
-    if (result.message_id) {
+    // Only mark a turn that actually produced something. An empty reply (a
+    // truncated/failed generation) has an announced message id that may never
+    // have been persisted, and storing it would poison the next turn with
+    // "invalid message id".
+    const producedSomething =
+      toolCalls.length > 0 || (out.content ?? "").trim() !== "";
+    if (result.message_id && producedSomething) {
       out.content = appendResumeMarker(out.content ?? "", {
-        chat_session_id: chatSessionId,
+        chat_session_id: turn.chatSessionId,
         message_id: result.message_id,
       });
     }
 
     return out;
   }
+}
+
+const LOST_SESSION_NOTICE =
+  "Could not continue the previous DeepSeek session — restored this " +
+  "conversation's header and history into a new one.";
+
+const LOST_PARENT_NOTICE =
+  "DeepSeek rejected the previous message id — continued this conversation " +
+  "with its header and history restored.";
+
+/**
+ * The prompt for one turn: normally just the last user message, plus the tool
+ * results produced since it so the model can decide what to do next.
+ */
+function buildPrompt(
+  userPrompt: string,
+  messages: ChatMessage[],
+  lastUserIdx: number,
+): string {
+  const recentResults = messages
+    .slice(lastUserIdx + 1)
+    .filter((m) => m.role === "tool")
+    .map((m) => (typeof m.content === "string" ? m.content : "{}"));
+  if (recentResults.length === 0) return userPrompt;
+
+  return (
+    "Tool results:\n" +
+    recentResults.join("\n") +
+    "\n\nTask: " +
+    userPrompt +
+    "\n\nContinue working on the task. Use more tools if you need more " +
+    "information or actions. When the task is fully complete, respond " +
+    "with your final answer as plain text."
+  );
+}
+
+export type LinkageKind = "new-session" | "drop-parent";
+
+export type TurnRequest = {
+  chat_session_id: string;
+  parent_message_id?: string;
+  prompt: string;
+};
+
+export type TurnLinkage = {
+  chatSessionId: string;
+  parentMessageId: string;
+  /** Without a parent there is no branch to continue, so the conversation's
+   *  header and history are replayed instead. */
+  seededPrompt: string;
+  basePrompt: string;
+};
+
+/**
+ * Send one turn, transparently recovering from a stale DeepSeek linkage.
+ *
+ * DeepSeek answers `biz_code 26 (invalid message id)` when the parent message
+ * no longer exists — typically because it came from a reply that never
+ * finished — and `biz_code 1 (invalid chat session id)` when the chat itself
+ * is gone. Neither is fatal: retry once without a parent (and, if the session
+ * is gone, in a fresh one) with the header and history replays, so a resumed
+ * conversation continues instead of every future turn failing forever.
+ */
+export async function sendTurnWithRecovery(
+  linkage: TurnLinkage,
+  send: (request: TurnRequest) => Promise<ChatResult>,
+  createSession: () => Promise<string>,
+  onRecover?: (kind: LinkageKind) => void,
+): Promise<{ result: ChatResult; chatSessionId: string; recovered: LinkageKind | null }> {
+  let chatSessionId = linkage.chatSessionId;
+  let parentMessageId = linkage.parentMessageId;
+  let prompt =
+    parentMessageId === "" ? linkage.seededPrompt : linkage.basePrompt;
+  let recovered: LinkageKind | null = null;
+
+  for (;;) {
+    try {
+      const result = await send({
+        chat_session_id: chatSessionId,
+        parent_message_id: parentMessageId || undefined,
+        prompt,
+      });
+      return { result, chatSessionId, recovered };
+    } catch (error) {
+      const kind: LinkageKind | null = recovered
+        ? null
+        : classifyLinkageError(error);
+      if (!kind) throw error;
+      recovered = kind;
+      if (kind === "new-session") chatSessionId = await createSession();
+      parentMessageId = "";
+      prompt = linkage.seededPrompt;
+      onRecover?.(kind);
+    }
+  }
+}
+
+/**
+ * Map a backend error to the linkage recovery it needs, if any:
+ *   - "new-session": the chat session itself is gone
+ *   - "drop-parent": the chat exists but the parent message id does not
+ * Anything else (a mute, a transport failure, a malformed body) is not a
+ * linkage problem and must be surfaced as-is.
+ */
+function classifyLinkageError(error: unknown): LinkageKind | null {
+  if (!(error instanceof DeepseekClientError)) return null;
+  if (error.bizCode === BIZ_CODE_INVALID_CHAT_SESSION) return "new-session";
+  if (error.bizCode === BIZ_CODE_INVALID_MESSAGE_ID) return "drop-parent";
+  // In-stream failures may only carry the human-readable text.
+  if (/invalid chat session id/i.test(error.message)) return "new-session";
+  if (/invalid message id/i.test(error.message)) return "drop-parent";
+  return null;
 }
 
 function extractResumeMarker(content: string | null): { chat_session_id: string; message_id: string } | null {

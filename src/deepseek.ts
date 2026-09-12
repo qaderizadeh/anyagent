@@ -60,10 +60,45 @@ export type DeepseekError = {
 
 export class DeepseekClientError extends Error {
   readonly kind: DeepseekError["type"];
-  constructor(kind: DeepseekError["type"], message: string) {
+  /** DeepSeek application-level error code (biz_code) when the backend
+   *  reported one. Lets callers recover from a stale session/message
+   *  linkage instead of failing the whole conversation. */
+  readonly bizCode?: number;
+  constructor(
+    kind: DeepseekError["type"],
+    message: string,
+    options: { bizCode?: number } = {},
+  ) {
     super(message);
     this.name = "DeepseekClientError";
     this.kind = kind;
+    this.bizCode = options.bizCode;
+  }
+}
+
+/**
+ * Application-level codes that mean our cached session linkage is stale, not
+ * that the request itself was wrong:
+ *   - 1  invalid chat session id  — the chat was deleted/expired on the web side
+ *   - 26 invalid message id       — the parent message no longer exists (e.g.
+ *                                   it came from a reply that never completed)
+ * Both are recoverable: continue in the same session without a parent, or
+ * create a fresh session, in either case replaying the header and history.
+ */
+export const BIZ_CODE_INVALID_CHAT_SESSION = 1;
+export const BIZ_CODE_INVALID_MESSAGE_ID = 26;
+
+/** Extract the biz_code from a non-streaming completion body, if present. */
+export function completionBodyBizCode(body: string): number | undefined {
+  try {
+    const root = JSON.parse(body) as {
+      data?: { biz_code?: unknown };
+      biz_code?: unknown;
+    };
+    const code = root?.data?.biz_code ?? root?.biz_code;
+    return typeof code === "number" ? code : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -178,6 +213,25 @@ export function describeSessionIssue(raw: DeepseekError): string {
     // transport problem, so the generic advice below would be misleading).
     if (/DeepSeek has muted this account|DeepSeek rejected/.test(raw.message)) {
       return raw.message;
+    }
+    // A gateway-level rejection means the request never reached the chat app.
+    // It shows up as HTTP 4xx, typically 422 with FastAPI's
+    // {"detail":[{"loc":"body"}]} body, and is about anti-bot state, not
+    // about the login being expired.
+    if (/HTTP 4\d\d/.test(raw.message) || /"detail"/.test(raw.message)) {
+      return (
+        "chat.deepseek.com rejected the request before it reached the chat app.\n" +
+        "\n" +
+        raw.message +
+        "\n" +
+        "\n" +
+        "This is a gateway/anti-bot rejection, not an expired login. It usually\n" +
+        "means the session's anti-bot cookie went stale, or DeepSeek is\n" +
+        "throttling this connection after a burst of requests.\n" +
+        "\n" +
+        "Wait a few minutes and try again. If it persists, re-capture both\n" +
+        "headers from the browser (the aws-waf-token cookie matters)."
+      );
     }
     return (
       "chat.deepseek.com did not behave as expected.\n" +
@@ -1047,7 +1101,9 @@ export async function chatCompletion(
   const contentType = resp.headers.get("content-type") ?? "";
   if (!contentType.includes("text/event-stream")) {
     const body = await resp.text().catch(() => "");
-    throw new DeepseekClientError("backend-error", describeCompletionBody(body));
+    throw new DeepseekClientError("backend-error", describeCompletionBody(body), {
+      bizCode: completionBodyBizCode(body),
+    });
   }
 
   const reader = resp.body?.getReader();
@@ -1104,7 +1160,9 @@ export async function chatCompletion(
         (typeof pCode === "number" && pCode !== 0) ||
         (typeof pBizCode === "number" && pBizCode !== 0)
       ) {
-        throw new DeepseekClientError("backend-error", describeCompletionBody(payloadText));
+        throw new DeepseekClientError("backend-error", describeCompletionBody(payloadText), {
+          bizCode: completionBodyBizCode(payloadText),
+        });
       }
 
       // The `ready` event carries the assistant message id directly:

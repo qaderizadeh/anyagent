@@ -53,27 +53,45 @@ export type AgentOptions = {
   onToolCallFinish?: (name: string, ok: boolean, result?: unknown) => void;
 };
 
-/** Strip the resume marker from assistant text before returning to the user. */
+/** True for the hidden resume marker (chat_session_id + message_id JSON). */
+function isResumeMarker(candidate: string): boolean {
+  if (!candidate.startsWith("{") || !candidate.endsWith("}")) return false;
+  try {
+    const parsed = JSON.parse(candidate) as {
+      chat_session_id?: unknown;
+      message_id?: unknown;
+      messageId?: unknown;
+    };
+    const mid = parsed.message_id ?? parsed.messageId;
+    return (
+      !!parsed &&
+      typeof parsed === "object" &&
+      typeof parsed.chat_session_id === "string" &&
+      (typeof mid === "string" || typeof mid === "number")
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Strip the resume marker from assistant text before returning to the user.
+ *
+ * This must also handle a message that is *nothing but* the marker. Those are
+ * produced when a reply came back empty (the marker was appended to no text),
+ * and leaving one in place made an empty reply look like a real answer — it
+ * printed raw `{"chat_session_id":...}` to the user, completed the turn as if
+ * it had succeeded, and stored a message id from a generation that may never
+ * have finished.
+ */
 function stripResumeMarker(text: string): string {
   if (!text) return text;
+  if (isResumeMarker(text.trim())) return "";
   const lastNewline = text.lastIndexOf("\n");
   if (lastNewline === -1) return text;
   const candidate = text.slice(lastNewline + 1).trim();
-  // The marker is a JSON object with chat_session_id and message_id fields.
-  if (candidate.startsWith("{") && candidate.endsWith("}")) {
-    try {
-      const parsed = JSON.parse(candidate);
-      if (
-        parsed &&
-        typeof parsed === "object" &&
-        typeof parsed.chat_session_id === "string" &&
-        typeof (parsed.message_id ?? parsed.messageId) === "string"
-      ) {
-        return text.slice(0, lastNewline).trimEnd();
-      }
-    } catch {
-      // not a marker
-    }
+  if (isResumeMarker(candidate)) {
+    return text.slice(0, lastNewline).trimEnd();
   }
   return text;
 }
@@ -193,7 +211,10 @@ export class Agent {
               "see the error above, then retry later."
             );
           }
-          this.messages.push({ role: "assistant", content: text });
+          // Push the stripped text, never the raw marker: an empty reply's
+          // message id may point at a generation that never completed, and
+          // keeping it would poison the next turn ("invalid message id").
+          this.messages.push({ role: "assistant", content: display });
           this.messages.push({ role: "user", content: "Please provide your final answer now." });
           continue;
         }
