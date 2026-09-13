@@ -1,607 +1,301 @@
 #!/usr/bin/env node
 /**
- * AnyAgent — interactive CLI for the agent (anydev.ir).
+ * AnyAgent — a small CLI agent on chat.deepseek.com.
  *
- *   anyagent                 start an interactive session
- *   anyagent "task"          run a single task and exit
- *   anyagent --resume        continue the most recent saved session
- *   anyagent --session ID    continue a specific saved session
- *   anyagent --cwd ./dir ... set the agent working directory
+ *   anyagent                  pick a session (or start one) and chat
+ *   anyagent "task"           run one task and exit
+ *   anyagent --new            force a brand-new session
+ *   anyagent --session ID     continue a specific session
+ *   anyagent --cwd DIR        working directory for bash commands
  *
- * Conversations are saved under ~/.anyagent/sessions/ so any session can be
- * listed and resumed later.
+ * Sessions and messages live on chat.deepseek.com. Nothing is stored locally
+ * except the captured credentials in DEEPSEEK_SESSION_JSON.
  */
 
 import { createInterface } from "node:readline/promises";
-import * as path from "node:path";
 import * as fs from "node:fs";
+import * as path from "node:path";
 
-import { Agent } from "./agent.js";
-import { Model, ModelError, type ChatMessage } from "./model.js";
+import { Agent, searchEnabled, thinkingEnabled } from "./agent.js";
 import {
-  loadSession,
-  normalizeSession,
-  resolvePowWasmPath,
-  sessionAgeWarning,
-  type DeepseekSession,
-} from "./deepseek.js";
-import { abortActiveCommand, tools } from "./tools.js";
-import {
+  BizError,
+  createSession,
+  history,
   listSessions,
-  loadSessionData,
-  saveSessionData,
-  newSessionId,
-  type SessionData,
-  type SessionMeta,
-} from "./sessions.js";
+  loadSession,
+  resolveWasmPath,
+  verifySession,
+  type ChatSession,
+  type Session,
+} from "./deepseek.js";
 
-const HELP_TEXT = `Commands:
-  /help      show this help
-  /sessions  list saved sessions and switch to one
-  /new       start a brand-new session
-  /clear     forget the current conversation
-  /exit      quit (also: Ctrl+C, Ctrl+D)
+const dim = (text: string): string => (process.stdout.isTTY ? `\x1b[2m${text}\x1b[0m` : text);
+const bold = (text: string): string => (process.stdout.isTTY ? `\x1b[1m${text}\x1b[0m` : text);
 
-While a task is running, Ctrl+C stops the current shell command and keeps
- the session alive, so the agent can see what failed and try again.
+const HELP = `Commands:
+  /help       show this
+  /sessions   list DeepSeek sessions and switch
+  /new        start a new DeepSeek session
+  /exit       quit (also Ctrl+C, Ctrl+D)
 
 Usage:
-  anyagent                 start an interactive session
-  anyagent "task"          run a single task and exit
-  anyagent --resume        continue the most recent saved session
-  anyagent --session ID    continue a specific saved session
-  anyagent --cwd DIR ...   set the agent working directory
+  anyagent                  pick a session and chat
+  anyagent "task"           run one task and exit
+  anyagent --new            new session
+  anyagent --session ID     continue a session
+  anyagent --cwd DIR        working directory
 
 Env:
-  DEEPSEEK_SESSION_PATH / DEEPSEEK_SESSION_JSON   DeepSeek web session
-  DEEPSEEK_SESSION_MAX_AGE_MS  advisory session-file freshness window (default 30 days)
-  DEEPSEEK_POW_WASM_PATH    path to sha3_wasm_bg.wasm (default ./sha3_wasm_bg.wasm)
-  DEEPSEEK_MODEL_TYPE       e.g. deepseek-reasoner (default: backend default)
-  DEEPSEEK_THINKING_ENABLED 1/true to enable deep thinking (default: enabled)
-  DEEPSEEK_SEARCH_ENABLED   1/true to allow web search (default: disabled)
-  DEEPSEEK_MAX_ITERATIONS   max agent loop iterations (default 50)
-  DEEPSEEK_SHELL_TIMEOUT_MS shell command timeout in ms (default 120000)
-  ANYAGENT_SESSIONS_DIR     where sessions are stored (default ~/.anyagent/sessions)`;
+  DEEPSEEK_SESSION_JSON / DEEPSEEK_SESSION_PATH   captured credentials
+  DEEPSEEK_MODEL_TYPE        backend model (default: backend default)
+  DEEPSEEK_THINKING_ENABLED  deep thinking (default: on)
+  DEEPSEEK_SEARCH_ENABLED    web search (default: off)
+  DEEPSEEK_MAX_ITERATIONS    loop limit (default: 50)
+  DEEPSEEK_SHELL_TIMEOUT_MS  command timeout (default: 120000)`;
 
-/* ------------------------------------------------------------------ */
-/* Colors — plain ANSI, no TUI framework, works in any terminal/SSH.   */
-/* ------------------------------------------------------------------ */
-
-const useColor =
-  process.stdout.isTTY &&
-  process.env["NO_COLOR"] == null &&
-  process.env["TERM"] !== "dumb";
-
-const ANSI = {
-  reset: "\x1b[0m",
-  bold: "\x1b[1m",
-  dim: "\x1b[2m",
-  cyan: "\x1b[36m",
-  green: "\x1b[32m",
-  red: "\x1b[31m",
-  yellow: "\x1b[33m",
-} as const;
-
-function paint(code: string, text: string): string {
-  return useColor ? `${code}${text}${ANSI.reset}` : text;
-}
-const bold = (t: string) => paint(ANSI.bold, t);
-const dim = (t: string) => paint(ANSI.dim, t);
-const cyan = (t: string) => paint(ANSI.cyan, t);
-const green = (t: string) => paint(ANSI.green, t);
-const red = (t: string) => paint(ANSI.red, t);
-const yellow = (t: string) => paint(ANSI.yellow, t);
-
-/* ------------------------------------------------------------------ */
-
-function envInt(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (raw == null || raw === "") return fallback;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isNaN(parsed) || parsed <= 0 ? fallback : parsed;
-}
-
-/** Parse a boolean env var: "1", "true", "yes", "on" → true; default otherwise. */
-function envBool(name: string, fallback: boolean): boolean {
-  const raw = process.env[name];
-  if (raw == null || raw.trim() === "") return fallback;
-  const v = raw.trim().toLowerCase();
-  if (["1", "true", "yes", "on"].includes(v)) return true;
-  if (["0", "false", "no", "off"].includes(v)) return false;
-  return fallback;
-}
-
-/** Keep activity lines readable: one line, and not absurdly long. */
-const MAX_PREVIEW_CHARS = 200;
-
-function preview(text: string): string {
-  const oneLine = text.replace(/\s+/g, " ").trim();
-  return oneLine.length > MAX_PREVIEW_CHARS
-    ? `${oneLine.slice(0, MAX_PREVIEW_CHARS - 1)}…`
-    : oneLine;
-}
-
-/** Short human label for a tool call, used in activity lines. */
-function describeToolCall(name: string, args?: Record<string, unknown>): string {
-  if (name === "shell" && args?.command != null) return preview(String(args.command));
-  if (!args) return "";
-  return preview(JSON.stringify(args));
-}
-
-/**
- * Render the outcome of a tool call. A command that timed out, was
- * interrupted, or exited non-zero is a failure — even though the tool
- * itself returned normally (the model gets to decide what to do next).
- */
-function describeToolOutcome(ok: boolean, result?: unknown): { failed: boolean; note: string } {
-  if (!ok) return { failed: true, note: "" };
-  const r = (result ?? {}) as { exitCode?: unknown; timedOut?: unknown; interrupted?: unknown };
-  if (r.interrupted === true) return { failed: true, note: dim(" (interrupted)") };
-  if (r.timedOut === true) return { failed: true, note: dim(" (timed out)") };
-  if (typeof r.exitCode === "number" && r.exitCode !== 0) {
-    return { failed: true, note: dim(` (exit ${r.exitCode})`) };
-  }
-  return { failed: false, note: "" };
-}
-
-function printBanner(model: Model, cwd: string, warning?: string): void {
-  console.log(bold(cyan("AnyAgent")));
-  console.log(dim("────────────────────────────"));
-  console.log(`Backend:   chat.deepseek.com (direct, no API key)`);
-  console.log(`Model:     ${model.modelType ?? "default (chat.deepseek.com)"}`);
-  console.log(`Thinking:  ${model.thinkingEnabled ? green("enabled") : "disabled"}`);
-  console.log(`Search:    ${model.searchEnabled ? green("enabled") : "disabled"}`);
-  console.log(`Directory: ${cwd}`);
-  if (warning) console.log(yellow(`! ${warning}`));
-  console.log();
-  console.log(yellow("WARNING: this agent executes shell commands and can modify files."));
-  console.log(yellow("Only run it in a directory/environment you trust."));
-  console.log();
-}
-
-function makeAgent(
-  model: Model,
-  cwd: string,
-  maxIterations: number,
-  messages?: ChatMessage[],
-): Agent {
-  // A new Agent means a new conversation: never reuse the DeepSeek session
-  // cached for the previous one.
-  model.resetLinkage();
-  return new Agent({
-    model,
-    tools,
-    cwd,
-    maxIterations,
-    messages,
-    onToolCallStart: (name, args) => {
-      const label = describeToolCall(name, args);
-      console.error(`  ${dim("→")} ${dim(`${name}${label ? `: ${label}` : ""}`)}`);
-    },
-    onToolCallFinish: (name, ok, result) => {
-      const { failed, note } = describeToolOutcome(ok, result);
-      console.error(`  ${failed ? red("✗") : green("✓")} ${name}${note}`);
-    },
-  });
-}
-
-function modelFromSession(session: DeepseekSession): Model {
-  return new Model({
-    session,
-    powWasmPath: resolvePowWasmPath(),
-    modelType: process.env["DEEPSEEK_MODEL_TYPE"] || undefined,
-    thinkingEnabled: envBool("DEEPSEEK_THINKING_ENABLED", true),
-    searchEnabled: envBool("DEEPSEEK_SEARCH_ENABLED", false),
-    onNotice: (message) => console.error(dim(`  ! ${message}`)),
-  });
-}
-
-type ParsedArgs = {
+type Args = {
   cwd: string;
+  session?: string;
+  fresh: boolean;
   task?: string;
-  resume: boolean;
-  sessionId?: string;
   help: boolean;
 };
 
-function parseArgs(argv: string[]): ParsedArgs {
-  const result: ParsedArgs = {
-    cwd: process.cwd(),
-    resume: false,
-    help: false,
-  };
-  const positionals: string[] = [];
+let rl: ReturnType<typeof createInterface> | undefined;
+let busy = false;
 
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg === "--help" || arg === "-h") {
-      result.help = true;
-    } else if (arg === "--resume") {
-      result.resume = true;
-    } else if (arg === "--session") {
-      const value = argv[++i];
-      if (value == null) throw new Error("--session requires a session id.");
-      result.sessionId = value;
-    } else if (arg.startsWith("--session=")) {
-      result.sessionId = arg.slice("--session=".length);
-    } else if (arg === "--cwd") {
-      const value = argv[++i];
-      if (value == null) throw new Error("--cwd requires a directory argument.");
-      result.cwd = path.resolve(process.cwd(), value);
-    } else if (arg.startsWith("--cwd=")) {
-      result.cwd = path.resolve(process.cwd(), arg.slice("--cwd=".length));
-    } else if (arg.startsWith("-") && arg !== "-") {
-      throw new Error(`Unknown option: ${arg}`);
-    } else {
-      positionals.push(arg);
-    }
-  }
+/**
+ * Line queue around readline.
+ *
+ * readline drops lines that arrive while no question is pending (which is
+ * exactly what happens when input is piped), so buffer them here instead.
+ * `null` means end of input.
+ */
+const queued: Array<string | null> = [];
+const pending: Array<(line: string | null) => void> = [];
+let ended = false;
 
-  if (positionals.length > 0) {
-    result.task = positionals.join(" ");
-  }
-  return result;
-}
-
-async function checkCwd(cwd: string): Promise<void> {
-  try {
-    const stat = await fs.promises.stat(cwd);
-    if (!stat.isDirectory()) {
-      throw new Error("not a directory");
-    }
-  } catch {
-    console.error(`Working directory does not exist or is not a directory: ${cwd}`);
-    process.exit(1);
-  }
-}
-
-async function runSingleTask(
-  agent: Agent,
-  model: Model,
-  task: string,
-): Promise<number> {
-  try {
-    const answer = await agent.run(task);
-    process.stdout.write(answer + "\n");
-    return 0;
-  } catch (error) {
-    if (error instanceof ModelError) {
-      console.error(red(error.message));
-    } else {
-      console.error(red(error instanceof Error ? error.message : String(error)));
-    }
-    return 1;
-  }
-}
-
-/** Ask the user to pick one of the listed sessions (or start a new one). */
-async function pickSession(
-  sessions: SessionMeta[],
-  nextLine: () => Promise<string | null>,
-): Promise<SessionMeta | null> {
-  console.log("Previous sessions:");
-  sessions.forEach((s, i) => {
-    const when = s.updatedAt.slice(0, 16).replace("T", " ");
-    console.log(`  [${i + 1}] ${dim(when)}  ${yellow(`"${s.title}"`)}  ${dim(`(${s.messageCount} msgs)`)}`);
+function startInput(): void {
+  rl ??= createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: Boolean(process.stdin.isTTY && process.stdout.isTTY),
   });
-  console.log("  [0] start a new session");
-  process.stdout.write(bold("Pick a session [0]: "));
-  const raw = await nextLine();
-  if (raw == null) return null;
-  const n = Number.parseInt(raw.trim(), 10);
-  if (Number.isInteger(n) && n >= 1 && n <= sessions.length) {
-    return sessions[n - 1];
-  }
-  return null;
-}
-
-type SessionState = {
-  id: string;
-  title: string;
-  createdAt: string;
-};
-
-async function runInteractive(
-  model: Model,
-  cwd: string,
-  maxIterations: number,
-  opts: { resume: boolean; sessionId?: string; startupWarning?: string },
-): Promise<number> {
-  printBanner(model, cwd, opts.startupWarning);
-
-  // Create the readline interface up front and attach a line listener
-  // immediately, so piped input (printf ... | anyagent) is never lost while
-  // we await session loading below. Lines are queued and consumed one at a
-  // time; EOF resolves pending readers with null.
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const inbox: string[] = [];
-  const waiters: ((line: string | null) => void)[] = [];
-  let eof = false;
   rl.on("line", (line) => {
-    const waiter = waiters.shift();
-    if (waiter) waiter(line);
-    else inbox.push(line);
+    const next = pending.shift();
+    if (next) next(line);
+    else queued.push(line);
   });
   rl.on("close", () => {
-    eof = true;
-    for (const waiter of waiters.splice(0)) waiter(null);
+    ended = true;
+    queued.push(null);
+    for (const next of pending.splice(0)) next(null);
   });
-  const nextLine = (): Promise<string | null> => {
-    if (inbox.length > 0) return Promise.resolve(inbox.shift()!);
-    if (eof) return Promise.resolve(null);
-    return new Promise((resolve) => {
-      waiters.push((line) => resolve(line ?? null));
-    });
-  };
-
-  // Exit cleanly, killing whatever shell command is still running so we
-  // never leave orphaned processes behind.
-  const shutdown = (code: number, reason: string): void => {
-    abortActiveCommand();
-    rl.close();
-    console.log();
-    console.log(`Bye.${dim(` (${reason})`)}`);
-    process.exit(code);
-  };
-
-  // Register signal handling before anything can block on input (session
-  // loading, the session picker). With a TTY, readline owns the terminal:
-  // Ctrl+C arrives as 'SIGINT' on the interface, never as a process signal,
-  // and with no listener readline silently pauses input — so the interface
-  // listener has to exist from the very first prompt.
-  //
-  // Ctrl+C stops the command that is running, if any, and the session stays
-  // alive so the model can see the failure and try something else. At the
-  // prompt it quits.
   rl.on("SIGINT", () => {
-    if (abortActiveCommand()) {
-      console.error();
-      console.error(dim("  ■ stopped the running command (Ctrl+C again to quit)"));
-      return;
-    }
-    shutdown(130, "Ctrl+C");
+    if (busy) return; // a running command should get the signal instead
+    process.stdout.write("\n");
+    process.exit(0);
   });
+}
 
-  // Piped input (no TTY) delivers a real process signal instead.
-  process.on("SIGINT", () => shutdown(130, "SIGINT"));
-  process.on("SIGTERM", () => shutdown(143, "SIGTERM"));
-  process.on("SIGHUP", () => shutdown(129, "SIGHUP"));
-  process.on("uncaughtException", (error) => {
-    console.error(red(error instanceof Error ? error.message : String(error)));
-    process.exit(1);
-  });
-  process.on("unhandledRejection", (reason) => {
-    console.error(red(reason instanceof Error ? reason.message : String(reason)));
-    process.exit(1);
-  });
+function ask(prompt: string): Promise<string | null> {
+  startInput();
+  process.stdout.write(prompt);
+  const buffered = queued.shift();
+  if (buffered !== undefined) return Promise.resolve(buffered);
+  if (ended) return Promise.resolve(null);
+  return new Promise((resolve) => pending.push(resolve));
+}
 
-  // Pick which session to start with (unless --resume/--session said so).
-  let state: SessionState;
-  let agent: Agent;
-
-  const sessions = await listSessions();
-  const startResumed = (data: SessionData) => {
-    state = { id: data.id, title: data.title, createdAt: data.createdAt };
-    agent = makeAgent(model, cwd, maxIterations, data.messages);
-    console.log(yellow(`Resuming session ${state.id}: "${state.title}"`));
-  };
-  const startNew = () => {
-    state = { id: newSessionId(), title: "", createdAt: new Date().toISOString() };
-    agent = makeAgent(model, cwd, maxIterations);
-  };
-
-  if (opts.sessionId) {
-    const data = await loadSessionData(opts.sessionId);
-    if (data) startResumed(data);
-    else {
-      console.error(red(`Session not found: ${opts.sessionId}`));
-      startNew();
-    }
-  } else if (opts.resume) {
-    const data = sessions.length > 0 ? await loadSessionData(sessions[0].id) : null;
-    if (data) startResumed(data);
-    else {
-      console.log(dim("No saved sessions — starting fresh."));
-      startNew();
-    }
-  } else if (sessions.length > 0) {
-    const picked = await pickSession(sessions, nextLine);
-    const data = picked ? await loadSessionData(picked.id) : null;
-    if (data) startResumed(data);
-    else startNew();
-  } else {
-    startNew();
+function parseArgs(argv: string[]): Args {
+  const args: Args = { cwd: process.cwd(), fresh: false, help: false };
+  const rest: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const flag = argv[i]!;
+    if (flag === "--cwd" || flag === "-C") args.cwd = argv[++i] ?? args.cwd;
+    else if (flag === "--session" || flag === "-s") args.session = argv[++i];
+    else if (flag === "--new" || flag === "-n") args.fresh = true;
+    else if (flag === "--help" || flag === "-h") args.help = true;
+    else rest.push(flag);
   }
-  console.log();
+  if (rest.length > 0) args.task = rest.join(" ");
+  return args;
+}
 
-  const persist = async (): Promise<void> => {
-    try {
-      const messages = agent.snapshot();
-      await saveSessionData({
-        id: state.id,
-        title: state.title,
-        createdAt: state.createdAt,
-        updatedAt: new Date().toISOString(),
-        messageCount: messages.length,
-        messages,
-      });
-    } catch (error) {
-      console.error(dim(`(could not save session: ${error instanceof Error ? error.message : String(error)})`));
-    }
-  };
+function when(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "                 ";
+  return new Date(seconds * 1000).toISOString().slice(0, 16).replace("T", " ");
+}
 
-  const switchToSession = async (id: string | null): Promise<void> => {
-    await persist();
-    if (id == null) {
-      startNew();
-      console.log(dim("Started a new session."));
-    } else {
-      const data = await loadSessionData(id);
-      if (!data) {
-        console.error(red(`Session not found: ${id}`));
-        return;
-      }
-      startResumed(data);
-      console.log(yellow(`Switched to session ${state.id}: "${state.title}"`));
-    }
-  };
+function oneLine(text: string, max = 100): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max)}...` : flat;
+}
 
-  const handleLine = async (rawLine: string): Promise<boolean> => {
-    const input = rawLine.trim();
-    if (input === "") return false;
+function printSessions(list: ChatSession[]): void {
+  console.log(dim("Sessions on chat.deepseek.com:"));
+  list.forEach((item, index) => {
+    console.log(`  [${index + 1}] ${when(item.updatedAt)}  ${oneLine(item.title, 70)}`);
+  });
+  console.log("  [0] start a new session\n");
+}
 
-    if (input === "/help") {
-      console.log(HELP_TEXT);
-      return false;
-    }
-    if (input === "/clear") {
-      agent.reset();
-      model.resetLinkage();
-      console.log("Conversation cleared.");
-      return false;
-    }
-    if (input === "/new") {
-      await switchToSession(null);
-      return false;
-    }
-    if (input === "/sessions") {
-      const all = await listSessions();
-      if (all.length === 0) {
-        console.log(dim("No saved sessions yet."));
-        return false;
-      }
-      const picked = await pickSession(all, nextLine);
-      if (picked) await switchToSession(picked.id);
-      return false;
-    }
-    if (input === "/exit" || input === "/quit") {
-      return true;
-    }
-    if (input.startsWith("/")) {
-      console.log(`Unknown command: ${input} (type /help for help)`);
-      return false;
-    }
+/** Newest message id in a chat session — the parent for the next turn. */
+async function tipOf(session: Session, chatId: string): Promise<number> {
+  const messages = await history(session, chatId).catch(() => []);
+  return messages.reduce((max, message) => Math.max(max, message.id), 0);
+}
 
-    if (!state.title) state.title = input.slice(0, 60);
-
-    try {
-      const started = Date.now();
-      const answer = await agent.run(input);
-      const elapsed = ((Date.now() - started) / 1000).toFixed(1);
-      console.log();
-      console.log(answer);
-      console.log(dim(`(${elapsed}s)`));
-    } catch (error) {
-      console.error();
-      if (error instanceof ModelError) {
-        console.error(red(error.message));
-      } else {
-        console.error(red(error instanceof Error ? error.message : String(error)));
-      }
-      console.error("Try again, or type /exit to quit.");
-    }
-
-    await persist();
-    return false;
-  };
-
-  // Main loop. The queue-based nextLine keeps lines typed while a task is
-  // still running buffered, so they are processed afterwards in order.
-  for (;;) {
-    process.stdout.write(bold("> "));
-    const line = await nextLine();
-    if (line == null) break; // EOF (e.g. Ctrl+D)
-    const shouldExit = await handleLine(line);
-    if (shouldExit) break;
-  }
-
-  rl.close();
-  console.log("Bye.");
-  return 0;
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function main(): Promise<void> {
-  let parsed: ParsedArgs;
-  try {
-    parsed = parseArgs(process.argv.slice(2));
-  } catch (error) {
-    console.error(red(error instanceof Error ? error.message : String(error)));
-    console.error("Try --help.");
-    process.exit(1);
+  const args = parseArgs(process.argv.slice(2));
+  if (args.help) {
+    console.log(HELP);
+    return;
   }
 
-  if (parsed.help) {
-    console.log(HELP_TEXT);
-    process.exit(0);
+  const cwd = path.resolve(args.cwd);
+  if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) {
+    throw new Error(`Working directory does not exist: ${cwd}`);
   }
 
-  await checkCwd(parsed.cwd);
+  const session = loadSession();
+  await verifySession(session);
 
-  let session: DeepseekSession;
-  let sessionWarning: string | null = null;
-  try {
-    const loaded = await loadSession();
-    // Old session files are no longer fatal: DeepSeek tokens outlive the
-    // freshness window, so warn and let the backend verification decide.
-    sessionWarning = sessionAgeWarning(loaded);
-    // loadSession already canonicalizes; normalizing again is cheap and keeps
-    // this safe if a session is built from another source.
-    session = normalizeSession(loaded);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(red(message));
-    console.error("\nOnce the session is in place, run anyagent again.");
-    process.exit(1);
+  const wasmPath = resolveWasmPath();
+  const list = await listSessions(session, 10);
+
+  let chatId: string;
+  let parentId = 0;
+
+  if (args.session != null) {
+    chatId = args.session;
+    parentId = await tipOf(session, chatId);
+  } else if (args.fresh || args.task != null) {
+    chatId = await createSession(session);
+  } else {
+    if (list.length > 0) printSessions(list);
+    const asked = await ask(list.length > 0 ? "Pick [0]: " : "Start a new session? [y]: ");
+    if (asked === null) return;
+    const choice = Number(asked.trim() === "" ? "0" : asked.trim());
+    const picked =
+      Number.isInteger(choice) && choice >= 1 && choice <= list.length
+        ? list[choice - 1]!.id
+        : undefined;
+    chatId = picked ?? (await createSession(session));
+    parentId = picked ? await tipOf(session, chatId) : 0;
   }
 
-  const model = modelFromSession(session);
+  console.log(bold("AnyAgent"));
+  console.log("────────────────────────────");
+  console.log(`${dim("Backend:  ")} chat.deepseek.com (web session)`);
+  console.log(`${dim("Session:  ")} ${chatId}`);
+  console.log(`${dim("Thinking: ")} ${thinkingEnabled() ? "enabled" : "disabled"}`);
+  console.log(`${dim("Search:   ")} ${searchEnabled() ? "enabled" : "disabled"}`);
+  console.log(`${dim("Directory:")} ${cwd}`);
+  console.log();
+  console.log(dim("WARNING: this agent runs bash commands and can modify files."));
+  console.log(dim("Only run it in a directory/environment you trust."));
+  console.log();
 
-  // Verify the session actually works against chat.deepseek.com.
-  try {
-    await model.healthCheck();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error(red(message));
-    console.error("\nOnce the session is in place, run anyagent again.");
-    process.exit(1);
-  }
+  const agent = new Agent(session, chatId, wasmPath, cwd, parentId || undefined);
 
-  const maxIterations = envInt("DEEPSEEK_MAX_ITERATIONS", 50);
-
-  if (parsed.task) {
-    if (sessionWarning) console.error(yellow(`! ${sessionWarning}`));
-    const agent = makeAgent(model, parsed.cwd, maxIterations);
-    const code = await runSingleTask(agent, model, parsed.task);
-    if (code === 0) {
-      // Record the single run as a session so it can be continued later.
-      try {
-        const messages = agent.snapshot();
-        const id = newSessionId();
-        await saveSessionData({
-          id,
-          title: parsed.task.slice(0, 60),
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-          messageCount: messages.length,
-          messages,
-        });
-        console.log(dim(`Session saved as ${id} — continue later with: anyagent --session ${id}`));
-      } catch {
-        // saving is best-effort
-      }
+  const runTask = async (task: string): Promise<void> => {
+    const started = Date.now();
+    busy = true;
+    let answer: string;
+    try {
+      answer = await agent.run(task, {
+        onTool: (command) => console.log(dim(`  -> shell: ${oneLine(command, 120)}`)),
+        onToolResult: (result) =>
+          console.log(dim(`     ${result.exitCode === 0 ? "ok" : `exit ${result.exitCode}`}`)),
+        onNewSession: () =>
+          console.log(dim("  ! the previous DeepSeek session was gone; started a new one")),
+      });
+    } finally {
+      busy = false;
     }
-    process.exit(code);
+    console.log();
+    console.log(answer);
+    console.log(dim(`(${((Date.now() - started) / 1000).toFixed(1)}s)`));
+  };
+
+  if (args.task != null) {
+    await runTask(args.task);
+    return;
   }
 
-  await runInteractive(model, parsed.cwd, maxIterations, {
-    resume: parsed.resume,
-    sessionId: parsed.sessionId,
-    startupWarning: sessionWarning ?? undefined,
-  });
-  process.exit(0);
+  console.log(dim("Type a task, or /help.\n"));
+  for (;;) {
+    const line = await ask("> ");
+    if (line === null) break; // Ctrl+D / end of input
+    const input = line.trim();
+    if (input === "") continue;
+
+    if (!input.startsWith("/")) {
+      try {
+        await runTask(input);
+      } catch (error) {
+        console.log();
+        console.log(
+          error instanceof BizError
+            ? `DeepSeek error (${error.code}): ${error.message}`
+            : errorText(error),
+        );
+        console.log(dim("Try again, or /exit to quit."));
+      }
+      continue;
+    }
+
+    const [command] = input.slice(1).split(/\s+/);
+
+    if (command === "exit" || command === "quit") break;
+
+    if (command === "help") {
+      console.log(HELP);
+      continue;
+    }
+
+    if (command === "new") {
+      agent.repoint(await createSession(session));
+      console.log(dim("Started a new DeepSeek session."));
+      continue;
+    }
+
+    if (command === "sessions") {
+      const fresh = await listSessions(session);
+      if (fresh.length === 0) {
+        console.log(dim("No sessions on the backend yet."));
+        continue;
+      }
+      printSessions(fresh);
+      const asked = await ask("Continue which? [0 = cancel]: ");
+      const choice = Number((asked ?? "0").trim());
+      if (Number.isInteger(choice) && choice >= 1 && choice <= fresh.length) {
+        const chosen = fresh[choice - 1]!;
+        agent.repoint(chosen.id, (await tipOf(session, chosen.id)) || undefined);
+        console.log(dim(`Continuing "${oneLine(chosen.title, 60)}".`));
+      }
+      continue;
+    }
+
+    console.log(dim(`Unknown command: /${command}`));
+  }
+
+  console.log(dim("Bye."));
 }
 
-main().catch((error) => {
-  console.error(red(error instanceof Error ? error.message : String(error)));
-  process.exit(1);
-});
+main()
+  .then(() => {
+    rl?.close();
+    process.exit(0);
+  })
+  .catch((error: unknown) => {
+    console.log();
+    console.log(errorText(error));
+    rl?.close();
+    process.exit(1);
+  });

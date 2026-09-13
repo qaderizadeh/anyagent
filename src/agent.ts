@@ -1,327 +1,301 @@
 /**
- * The agent loop. The entire heart of the application lives here:
+ * The agent: a loop, one tool, and a very small tool-call parser.
  *
- *   user task → DeepSeek → tool calls? → execute tools → back to DeepSeek
- *                          → no → return final answer
+ *   task -> model -> tool call? -> run bash -> send result -> model -> ...
+ *
+ * Conversation state is not kept here. It lives in the chat session on
+ * chat.deepseek.com; this process only carries the current prompt and the
+ * message id to reply to.
  */
 
+import { exec } from "node:child_process";
 import {
-  ModelError,
-  SYSTEM_PROMPT,
-  TOOL_REMINDER,
-  TOOL_USAGE_INSTRUCTIONS,
-  type ChatMessage,
-  type Model,
-  type ToolDefinition,
-} from "./model.js";
-import type { Tool } from "./tools.js";
+  BizError,
+  complete,
+  createSession,
+  type Completion,
+  type Session,
+} from "./deepseek.js";
 
-export { SYSTEM_PROMPT };
+const MAX_STEPS = intEnv("DEEPSEEK_MAX_ITERATIONS", 50);
+const SHELL_TIMEOUT_MS = intEnv("DEEPSEEK_SHELL_TIMEOUT_MS", 120_000);
+const MAX_OUTPUT_CHARS = 30_000;
 
-const MAX_UNPARSEABLE_TOOL_CALL_RETRIES = 3;
-/** Consecutive empty model replies before giving up (a rate-limited or
- *  muted backend otherwise burns every iteration returning nothing). */
-const MAX_EMPTY_RESPONSES = 5;
-
-const UNPARSEABLE_TOOL_CALL_NUDGE = `Your previous message was a tool call that could not be parsed. Do not explain it or apologize — just re-send the tool call as valid JSON on a single line, in exactly this shape:
-{"tool_calls":[{"id":"1","type":"function","function":{"name":"shell","arguments":{"command":"COMMAND"}}}]}
-Never use XML tags such as <tool_calls>, <invoke> or <parameter> — only the JSON above.
-Escape only double quotes and backslashes. Never escape any other character (no \\$, no \\', no \\. ).`;
-
-/** Retryable failures: a network hiccup or a transient backend refusal. */
-const RETRYABLE_ERROR_KINDS: ReadonlyArray<ModelError["kind"]> = ["network", "pow-error"];
-/** Backoff between retries of a transient failure. */
-const RETRY_DELAYS_MS = [1000, 4000];
-
-/**
- * True when a "final answer" is really a tool call the parser could not read —
- * either a JSON block or the XML markup some replies fall back to:
- *
- *   <tool_calls>
- *     <invoke name="shell">
- *       <parameter name="command">ls -la</parameter>
- *     </invoke>
- *   </tool_calls>
- *
- * Showing either to the user is never useful: it means the model asked for an
- * action that never ran.
- */
-function looksLikeUnparsedToolCall(text: string): boolean {
-  if (/"tool_calls"\s*:/.test(text) && /"function"\s*:/.test(text)) return true;
-  return /<\/?tool_calls\b|<\/?function_calls\b|<invoke\s+name\s*=/i.test(text);
+function intEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
-export type AgentOptions = {
-  model: Model;
-  tools: Record<string, Tool>;
-  cwd?: string;
-  maxIterations?: number;
-  /** Initial conversation, used to resume a saved session. */
-  messages?: ChatMessage[];
-  /** Called before a tool executes. `args` is undefined when arguments failed to parse. */
-  onToolCallStart?: (name: string, args?: Record<string, unknown>) => void;
-  /**
-   * Called after a tool execution attempt. `result` is the tool's own
-   * result (or the error object) so the caller can report what actually
-   * happened — e.g. a timed-out command is not a success.
-   */
-  onToolCallFinish?: (name: string, ok: boolean, result?: unknown) => void;
+/** Instructions sent as the first message of a new chat session. */
+export const TOOL_HEADER = [
+  "You are a command-line agent. You act on the user's computer with one tool:",
+  "  shell(command) - run one bash command in the working directory.",
+  "",
+  'To act, reply with ONLY this JSON, one command at a time:',
+  '{"tool_calls":[{"id":"1","type":"function","function":{"name":"shell","arguments":{"command":"ls -la"}}}]}',
+  "",
+  'Each result comes back as {"exitCode":0,"stdout":"...","stderr":"..."}.',
+  "Read it, then call the tool again or answer in plain text when the task is done.",
+  "Never claim you did something unless a tool result shows it succeeded.",
+  "Keep the final answer short.",
+].join("\n");
+
+const EMPTY_NUDGE =
+  'Your reply was empty. Either call the shell tool, or give your final answer as plain text.';
+const UNPARSEABLE_NUDGE =
+  "That tool call could not be parsed. Re-send it as valid JSON on a single line:\n" +
+  '{"tool_calls":[{"id":"1","type":"function","function":{"name":"shell","arguments":{"command":"..."}}}]}';
+
+const MAX_STUCK_STEPS = 4;
+
+export type ShellResult = {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
 };
 
-/** True for the hidden resume marker (chat_session_id + message_id JSON). */
-function isResumeMarker(candidate: string): boolean {
-  if (!candidate.startsWith("{") || !candidate.endsWith("}")) return false;
-  try {
-    const parsed = JSON.parse(candidate) as {
-      chat_session_id?: unknown;
-      message_id?: unknown;
-      messageId?: unknown;
-    };
-    const mid = parsed.message_id ?? parsed.messageId;
-    return (
-      !!parsed &&
-      typeof parsed === "object" &&
-      typeof parsed.chat_session_id === "string" &&
-      (typeof mid === "string" || typeof mid === "number")
+/* ------------------------------------------------------------------ */
+/* tool                                                                */
+/* ------------------------------------------------------------------ */
+
+function clip(text: string): string {
+  if (text.length <= MAX_OUTPUT_CHARS) return text;
+  return `${text.slice(0, MAX_OUTPUT_CHARS)}\n... [truncated ${text.length - MAX_OUTPUT_CHARS} chars]`;
+}
+
+/** Run one bash command and always resolve with its exit code and output. */
+export function runShell(command: string, cwd: string): Promise<ShellResult> {
+  return new Promise((resolve) => {
+    exec(
+      command,
+      { cwd, shell: "/bin/bash", timeout: SHELL_TIMEOUT_MS, killSignal: "SIGKILL", maxBuffer: 16 * 1024 * 1024 },
+      (error, stdout, stderr) => {
+        const failure = error as (Error & { code?: number | string; killed?: boolean }) | null;
+        const exitCode =
+          failure == null ? 0 : typeof failure.code === "number" ? failure.code : 1;
+        const killed = failure?.killed ? `\n[killed after ${SHELL_TIMEOUT_MS}ms]` : "";
+        resolve({
+          exitCode,
+          stdout: clip(String(stdout)),
+          stderr: clip(String(stderr) + killed),
+        });
+      },
     );
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* tool-call parsing                                                   */
+/* ------------------------------------------------------------------ */
+
+const LOOKS_LIKE_CALL = /tool_calls|<invoke|"name"\s*:\s*"shell"/;
+
+function decodeEntities(text: string): string {
+  return text
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+/** Undo the JSON escaping a model sometimes applies to the whole call. */
+function unescapeMarkup(text: string): string {
+  return text.replace(/\\(["'/\\])/g, "$1");
+}
+
+/** Read a command out of a JSON argument object (or a stringified one). */
+function commandFromJson(raw: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.trim());
   } catch {
-    return false;
+    return null;
   }
-}
+  if (typeof parsed === "string") return parsed;
+  if (!parsed || typeof parsed !== "object") return null;
 
-/**
- * Strip the resume marker from assistant text before returning to the user.
- *
- * This must also handle a message that is *nothing but* the marker. Those are
- * produced when a reply came back empty (the marker was appended to no text),
- * and leaving one in place made an empty reply look like a real answer — it
- * printed raw `{"chat_session_id":...}` to the user, completed the turn as if
- * it had succeeded, and stored a message id from a generation that may never
- * have finished.
- */
-function stripResumeMarker(text: string): string {
-  if (!text) return text;
-  if (isResumeMarker(text.trim())) return "";
-  const lastNewline = text.lastIndexOf("\n");
-  if (lastNewline === -1) return text;
-  const candidate = text.slice(lastNewline + 1).trim();
-  if (isResumeMarker(candidate)) {
-    return text.slice(0, lastNewline).trimEnd();
+  const object = parsed as Record<string, unknown>;
+  for (const key of ["command", "cmd", "script", "code"]) {
+    if (typeof object[key] === "string") return object[key] as string;
   }
-  return text;
-}
-
-/** Parse OpenAI tool_call.function.arguments (a JSON string, or already an object). */
-function parseToolArguments(raw: unknown): Record<string, unknown> | null {
-  if (raw == null || raw === "") return {};
-  let value: unknown = raw;
-  if (typeof raw === "string") {
-    try {
-      value = JSON.parse(raw);
-    } catch {
-      return null;
-    }
-  }
-  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-    return value as Record<string, unknown>;
-  }
+  // The model sometimes wraps the whole argument object one level deep.
+  const nested = object["arguments"];
+  if (typeof nested === "string") return commandFromJson(nested);
+  if (nested && typeof nested === "object") return commandFromJson(JSON.stringify(nested));
   return null;
 }
 
+/**
+ * Extract the shell commands from a reply.
+ *
+ * Understands the plain JSON form plus the XML-ish spellings the model
+ * occasionally falls back to, including JSON-escaped and HTML-escaped tags.
+ */
+export function parseCommands(reply: string): string[] {
+  const commands: string[] = [];
+  const add = (value: string | null): void => {
+    const command = (value ?? "").trim();
+    if (command !== "" && !commands.includes(command)) commands.push(command);
+  };
+
+  for (const variant of [reply, unescapeMarkup(decodeEntities(reply))]) {
+    if (!LOOKS_LIKE_CALL.test(variant)) continue;
+
+    // {"command": "..."}
+    for (const match of variant.matchAll(/"command"\s*:\s*"((?:[^"\\]|\\.)*)"/g)) {
+      add(commandFromJson(`"${match[1]}"`));
+    }
+    // {"arguments": {"command": "..."}}
+    for (const match of variant.matchAll(/"arguments"\s*:\s*(\{[\s\S]*?\})\s*}/g)) {
+      add(commandFromJson(match[1]));
+    }
+    // <parameter name="command">...</parameter>
+    for (const match of variant.matchAll(
+      /<parameter[^>]*name\s*=\s*"?command"?[^>]*>([\s\S]*?)<\/parameter>/g,
+    )) {
+      add(decodeEntities(match[1]));
+    }
+    // <parameter name="arguments">{"command":"..."}</parameter>
+    for (const match of variant.matchAll(
+      /<parameter[^>]*name\s*=\s*"?arguments"?[^>]*>([\s\S]*?)<\/parameter>/g,
+    )) {
+      add(commandFromJson(decodeEntities(match[1])));
+    }
+
+    if (commands.length > 0) break;
+  }
+
+  return commands;
+}
+
+/* ------------------------------------------------------------------ */
+/* agent                                                               */
+/* ------------------------------------------------------------------ */
+
+export type AgentEvents = {
+  onTool?: (command: string) => void;
+  onToolResult?: (result: ShellResult) => void;
+  /** The backend lost the chat session, so a fresh one was created. */
+  onNewSession?: (chatId: string) => void;
+};
+
 export class Agent {
-  private messages: ChatMessage[];
-  private readonly model: Model;
-  private readonly tools: Record<string, Tool>;
-  private readonly cwd: string;
-  private readonly maxIterations: number;
-  private readonly onToolCallStart?: (name: string, args?: Record<string, unknown>) => void;
-  private readonly onToolCallFinish?: (name: string, ok: boolean, result?: unknown) => void;
+  private parentId?: number | string;
 
-  constructor(options: AgentOptions) {
-    this.model = options.model;
-    this.tools = options.tools;
-    this.cwd = options.cwd ?? process.cwd();
-    this.maxIterations = options.maxIterations ?? 50;
-    this.onToolCallStart = options.onToolCallStart;
-    this.onToolCallFinish = options.onToolCallFinish;
-    this.messages = (options.messages ?? []).map((m) => ({ ...m }));
+  constructor(
+    private readonly session: Session,
+    private chatId: string,
+    private readonly wasmPath: string,
+    private readonly cwd: string,
+    parentId?: number | string,
+  ) {
+    this.parentId = parentId;
   }
 
-  /** Forget the current conversation (used by /clear). */
-  reset(): void {
-    this.messages = [];
+  get id(): string {
+    return this.chatId;
   }
 
-  /** Current conversation, for persisting to a session file. */
-  snapshot(): ChatMessage[] {
-    return this.messages.map((m) => ({ ...m }));
+  /** Point this agent at another chat session (used by /new and /sessions). */
+  repoint(chatId: string, parentId?: number | string): void {
+    this.chatId = chatId;
+    this.parentId = parentId;
   }
 
-  /**
-   * Ask the model, retrying transient failures (a dropped connection, a
-   * timeout, an HTTP 429/5xx) twice with a short backoff. The conversation is
-   * only mutated after a successful chat, so retrying with the same messages
-   * is safe. Everything deterministic — a dead session, a mute, a malformed
-   * reply, a stale message id — is rethrown immediately.
-   */
-  private async chatWithRetry(definitions: ToolDefinition[]): Promise<ChatMessage> {
-    for (let attempt = 0; ; attempt++) {
-      try {
-        return await this.model.chat(this.messages, definitions);
-      } catch (error) {
-        // Only transport-level failures are worth repeating. A session
-        // problem, a mute, or a malformed reply is deterministic — repeating
-        // it just burns quota and hides the real cause.
-        const retryable =
-          error instanceof ModelError &&
-          RETRYABLE_ERROR_KINDS.includes(error.kind);
-        if (!retryable || attempt >= RETRY_DELAYS_MS.length) throw error;
-        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAYS_MS[attempt]));
-      }
-    }
-  }
+  async run(task: string, events: AgentEvents = {}): Promise<string> {
+    let prompt = `${TOOL_HEADER}\n\n${task}`;
+    let stuck = 0;
 
-  /**
-   * Run one user task. In interactive mode callers reuse the same Agent so
-   * the conversation is preserved across tasks.
-   */
-  async run(task: string): Promise<string> {
-    if (typeof task !== "string" || task.trim() === "") {
-      throw new Error("Task must be a non-empty string.");
-    }
+    for (let step = 0; step < MAX_STEPS; step++) {
+      const reply = await this.send(prompt, events);
+      const commands = parseCommands(reply.text);
 
-    if (this.messages.length === 0) {
-      this.messages.push({ role: "system", content: SYSTEM_PROMPT });
-    }
+      if (commands.length === 0) {
+        const answer = reply.text.trim();
 
-    // On the first turn prepend full tool instructions; on later turns add
-    // a one-line reminder — the model sometimes forgets to use tools.
-    const isFirstTurn = this.messages.length === 1;
-    let userContent = task;
-    if (isFirstTurn) {
-      userContent = TOOL_USAGE_INSTRUCTIONS + "\n\n" + task;
-    } else {
-      userContent = TOOL_REMINDER + "\n\n" + task;
-    }
-    this.messages.push({ role: "user", content: userContent });
+        if (answer !== "" && !LOOKS_LIKE_CALL.test(answer)) return answer;
 
-    const definitions = Object.values(this.tools).map((tool) => tool.definition);
-
-    let unparseableAttempts = 0;
-    let emptyAttempts = 0;
-
-    for (let iteration = 0; iteration < this.maxIterations; iteration++) {
-      const assistant = await this.chatWithRetry(definitions);
-
-      const toolCalls = Array.isArray(assistant.tool_calls) ? assistant.tool_calls : [];
-      if (toolCalls.length > 0) emptyAttempts = 0;
-      if (toolCalls.length === 0) {
-        // Final answer.
-        const text = typeof assistant.content === "string" ? assistant.content : "";
-        const display = stripResumeMarker(text).trim();
-        if (display === "") {
-          // The model returned empty — nudge it to give a final answer, but
-          // stop after a few tries instead of burning every iteration.
-          emptyAttempts++;
-          if (emptyAttempts > MAX_EMPTY_RESPONSES) {
-            return (
-              "Agent stopped: the model returned empty responses " +
-              `${MAX_EMPTY_RESPONSES + 1} times in a row. ` +
-              "The backend may be rate-limiting or muting this account — " +
-              "see the error above, then retry later."
-            );
-          }
-          // Push the stripped text, never the raw marker: an empty reply's
-          // message id may point at a generation that never completed, and
-          // keeping it would poison the next turn ("invalid message id").
-          this.messages.push({ role: "assistant", content: display });
-          this.messages.push({ role: "user", content: "Please provide your final answer now." });
-          continue;
-        }
-        // Never surface an unparsed tool-call block as the final answer: it
-        // means the model wanted an action that never ran. Ask it to re-send
-        // the call, a bounded number of times, then fail honestly.
-        if (looksLikeUnparsedToolCall(display)) {
-          unparseableAttempts++;
-          emptyAttempts = 0;
-          if (unparseableAttempts <= MAX_UNPARSEABLE_TOOL_CALL_RETRIES) {
-            this.messages.push({ role: "assistant", content: text });
-            this.messages.push({ role: "user", content: UNPARSEABLE_TOOL_CALL_NUDGE });
-            continue;
-          }
-          return (
-            "Agent stopped: the model returned malformed tool-call JSON " +
-            `${MAX_UNPARSEABLE_TOOL_CALL_RETRIES} times and it could not be parsed.`
+        stuck += 1;
+        if (stuck > MAX_STUCK_STEPS) {
+          throw new Error(
+            "The model kept replying with an unusable reply. Last one:\n" +
+              reply.text.slice(0, 400),
           );
         }
-        this.messages.push({ role: "assistant", content: text });
-        return display;
+        prompt = answer === "" ? EMPTY_NUDGE : UNPARSEABLE_NUDGE;
+        continue;
       }
 
-      // Preserve the assistant message with its tool_calls, then execute
-      // each call and append its result.
-      this.messages.push({
-        role: "assistant",
-        content: assistant.content ?? null,
-        tool_calls: toolCalls,
-      });
-
-      for (const rawCall of toolCalls) {
-        const call = rawCall as {
-          id?: unknown;
-          function?: { name?: unknown; arguments?: unknown };
-        };
-        const name = typeof call.function?.name === "string" ? call.function.name : "";
-        const callId = typeof call.id === "string" ? call.id : "";
-
-        let result: unknown = {
-          error: true,
-          message: "Tool call is missing a function name.",
-        };
-        let ok = false;
-
-        if (name !== "") {
-          let args: Record<string, unknown> | null = null;
-          try {
-            args = parseToolArguments(call.function?.arguments);
-          } catch {
-            args = null;
-          }
-          this.onToolCallStart?.(name, args ?? undefined);
-
-          if (args === null) {
-            result = {
-              error: true,
-              message: `Invalid JSON arguments for tool "${name}".`,
-            };
-          } else if (!this.tools[name]) {
-            result = { error: true, message: `Unknown tool: ${name}` };
-          } else {
-            try {
-              result = await this.tools[name].execute(args, { cwd: this.cwd });
-              ok = true;
-            } catch (error) {
-              // A tool failure must never crash the agent: report it back
-              // to the model so it can decide what to do next.
-              result = {
-                error: true,
-                message: error instanceof Error ? error.message : String(error),
-              };
-            }
-          }
-        } else {
-          this.onToolCallStart?.(name);
-        }
-
-        this.onToolCallFinish?.(name, ok, result);
-        this.messages.push({
-          role: "tool",
-          tool_call_id: callId,
-          content: JSON.stringify(result),
-        });
+      stuck = 0;
+      const results: ShellResult[] = [];
+      for (const command of commands) {
+        events.onTool?.(command);
+        const result = await runShell(command, this.cwd);
+        events.onToolResult?.(result);
+        results.push(result);
       }
+      prompt = `Tool results:\n${JSON.stringify(results)}`;
     }
 
     return "Agent stopped: maximum iterations reached.";
   }
+
+  /**
+   * One model turn. A stale message id or a chat session that no longer
+   * exists on the backend is recovered once, then the error is real.
+   */
+  private async send(prompt: string, events: AgentEvents): Promise<Completion> {
+    try {
+      return await this.completeTurn(prompt);
+    } catch (error) {
+      if (error instanceof BizError && error.code === 26) {
+        // The parent message id is gone from this chat; branch from the end.
+        this.parentId = undefined;
+        return this.completeTurn(prompt);
+      }
+      if (error instanceof BizError && error.code === 1) {
+        // The chat session itself was deleted on DeepSeek's side.
+        this.chatId = await createSession(this.session);
+        this.parentId = undefined;
+        events.onNewSession?.(this.chatId);
+        return this.completeTurn(
+          `(The previous chat session no longer exists, so this is a new one. Continue the task.)\n\n${prompt}`,
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async completeTurn(prompt: string): Promise<Completion> {
+    const reply = await complete(
+      this.session,
+      {
+        chatId: this.chatId,
+        prompt,
+        parentId: this.parentId,
+        thinking: thinkingEnabled(),
+        search: searchEnabled(),
+        modelType: process.env["DEEPSEEK_MODEL_TYPE"] || undefined,
+      },
+      this.wasmPath,
+    );
+    if (reply.messageId) this.parentId = reply.messageId;
+    return reply;
+  }
+}
+
+function boolEnv(name: string, fallback: boolean): boolean {
+  const raw = process.env[name];
+  if (raw == null || raw.trim() === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+}
+
+/** Deep thinking is on by default; web search is off by default. */
+export function thinkingEnabled(): boolean {
+  return boolEnv("DEEPSEEK_THINKING_ENABLED", true);
+}
+
+export function searchEnabled(): boolean {
+  return boolEnv("DEEPSEEK_SEARCH_ENABLED", false);
 }
