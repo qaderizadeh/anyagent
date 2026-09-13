@@ -46,7 +46,8 @@ const UNPARSEABLE_NUDGE =
   "That tool call could not be parsed. Re-send it as valid JSON on a single line:\n" +
   '{"tool_calls":[{"id":"1","type":"function","function":{"name":"shell","arguments":{"command":"..."}}}]}';
 
-const MAX_STUCK_STEPS = 4;
+/** Extra attempts allowed for an empty or unreadable reply. */
+const MAX_RETRIES = 2;
 
 export type ShellResult = {
   exitCode: number;
@@ -216,7 +217,7 @@ export class Agent {
 
   async run(task: string, events: AgentEvents = {}): Promise<string> {
     let prompt = `${TOOL_HEADER}\n\n${task}`;
-    let stuck = 0;
+    let retries = 0;
 
     for (let step = 0; step < MAX_STEPS; step++) {
       const reply = await this.send(prompt, events);
@@ -227,18 +228,22 @@ export class Agent {
 
         if (answer !== "" && !LOOKS_LIKE_CALL.test(answer)) return answer;
 
-        stuck += 1;
-        if (stuck > MAX_STUCK_STEPS) {
+        retries += 1;
+        if (retries > MAX_RETRIES) {
+          // Retrying again just burns model calls; DeepSeek is not answering.
           throw new Error(
-            "The model kept replying with an unusable reply. Last one:\n" +
-              reply.text.slice(0, 400),
+            answer === ""
+              ? "DeepSeek returned an empty reply twice in a row, so the task stopped here.\n" +
+                "The conversation is intact on chat.deepseek.com — send the task again, or use /new."
+              : "DeepSeek replied with tool markup that could not be read:\n" +
+                answer.slice(0, 300),
           );
         }
         prompt = answer === "" ? EMPTY_NUDGE : UNPARSEABLE_NUDGE;
         continue;
       }
 
-      stuck = 0;
+      retries = 0;
       const results: ShellResult[] = [];
       for (const command of commands) {
         events.onTool?.(command);
