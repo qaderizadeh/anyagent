@@ -27,9 +27,10 @@ import {
   verifySession,
   type ChatSession,
   type Session,
-} from "./deepseek.js";
+} from "./deepseek.js";const dim = (text: string): string => (process.stdout.isTTY ? `\x1b[2m${text}\x1b[0m` : text);
 
-const dim = (text: string): string => (process.stdout.isTTY ? `\x1b[2m${text}\x1b[0m` : text);
+
+
 const bold = (text: string): string => (process.stdout.isTTY ? `\x1b[1m${text}\x1b[0m` : text);
 
 const HELP = `Commands:
@@ -211,6 +212,9 @@ async function main(): Promise<void> {
     let answer: string;
     try {
       answer = await agent.run(task, {
+        onText: (text) => {
+          if (text !== "") console.log(dim(`  · ${oneLine(text, 200)}`));
+        },
         onTool: (command) => console.log(dim(`  -> shell: ${oneLine(command, 120)}`)),
         onToolResult: (result) =>
           console.log(dim(`     ${result.exitCode === 0 ? "ok" : `exit ${result.exitCode}`}`)),

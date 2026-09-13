@@ -121,10 +121,23 @@ One command per turn. The result goes back as
 `{"exitCode":0,"stdout":"...","stderr":"..."}`; a failing command does not
 stop the agent — the error goes back to the model, which decides what to do.
 
+`text` is printed for **every** step, so nothing the model says is hidden:
+
+```text
+  · Checking the Node.js version first.
+  -> shell: node --version
+     ok
+```
+
 An **empty or missing `command` means the turn is over**: the task is done, or
 the agent is blocked and needs you. Either way `text` is shown to you and the
-agent stops. If the reply is not this shape at all, the model is asked once to
-resend it, and the run stops rather than looping forever.
+agent stops.
+
+If a reply is not this shape, the model is asked again. When it still cannot go
+on, the message says which of the two things happened, instead of a generic
+failure: an **empty reply** (the backend sent nothing at all, so the same
+prompt is retried after a short delay) or a **wrong shape** (the offending
+reply is printed).
 
 ## Security
 

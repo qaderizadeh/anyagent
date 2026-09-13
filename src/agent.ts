@@ -20,8 +20,12 @@ import {
 const MAX_STEPS = intEnv("DEEPSEEK_MAX_ITERATIONS", 50);
 const SHELL_TIMEOUT_MS = intEnv("DEEPSEEK_SHELL_TIMEOUT_MS", 120_000);
 const MAX_OUTPUT_CHARS = 30_000;
-/** Extra attempts allowed for an empty or unreadable reply. */
+/** Extra attempts allowed for a reply we cannot use. */
 const MAX_RETRIES = 2;
+/** Wait before asking again when the backend sent nothing (it may be a hiccup). */
+const RETRY_DELAY_MS = 2_000;
+
+const sleep = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
 
 function intEnv(name: string, fallback: number): number {
   const value = Number(process.env[name]);
@@ -121,6 +125,8 @@ export function parseReply(reply: string): Reply | null {
 /* ------------------------------------------------------------------ */
 
 export type AgentEvents = {
+  /** What the model says about the step it is taking. */
+  onText?: (text: string) => void;
   onTool?: (command: string) => void;
   onToolResult?: (result: ShellResult) => void;
   /** The backend lost the chat session, so a fresh one was created. */
@@ -152,29 +158,49 @@ export class Agent {
 
   async run(task: string, events: AgentEvents = {}): Promise<string> {
     let prompt = `${HEADER}\n\nTask: ${task}`;
-    let retries = 0;
+    let quiet = 0; // the backend answered with nothing
+    let garbled = 0; // it answered, but not in the one shape we accept
 
     for (let step = 0; step < MAX_STEPS; step++) {
       const reply = await this.send(prompt, events);
-      const parsed = parseReply(reply.text);
+      const raw = reply.text.trim();
+      const parsed = parseReply(raw);
 
-      // No usable object, or one with nothing in it: ask once more, then stop.
+      // Nothing usable came back. Two different faults, two different answers:
+      // an empty reply is the backend not answering, so ask the same thing
+      // again; a reply in some other shape is the model's, so ask for the shape.
       if (parsed == null || (parsed.text === "" && parsed.command === "")) {
-        retries += 1;
-        if (retries > MAX_RETRIES) {
-          throw new Error(
-            "DeepSeek did not send a usable reply, so the task stopped here.\n" +
-              "The conversation is intact on chat.deepseek.com - send the task again, or use /new.",
-          );
+        if (raw === "") {
+          quiet += 1;
+          if (quiet > MAX_RETRIES) {
+            throw new Error(
+              `DeepSeek sent an empty reply ${quiet} times in a row, so the task stopped here.\n` +
+                "Nothing came back from the model at all - this is a backend hiccup, not a tool failure.\n" +
+                "The last tool result is still the last message on the chat: send the task again, or use /new.",
+            );
+          }
+          await sleep(RETRY_DELAY_MS * quiet);
+        } else {
+          garbled += 1;
+          if (garbled > MAX_RETRIES) {
+            throw new Error(
+              'DeepSeek never sent one {"text","command"} object, so the task stopped here.\n' +
+                "Its last reply was:\n" +
+                raw.slice(0, 400),
+            );
+          }
+          prompt = NUDGE;
         }
-        prompt = NUDGE;
         continue;
       }
+
+      quiet = 0;
+      garbled = 0;
 
       // An empty command is the agent's way of saying it is done or blocked.
       if (parsed.command === "") return parsed.text;
 
-      retries = 0;
+      events.onText?.(parsed.text);
       events.onTool?.(parsed.command);
       const result = await runShell(parsed.command, this.cwd);
       events.onToolResult?.(result);
@@ -223,7 +249,9 @@ export class Agent {
       },
       this.wasmPath,
     );
-    if (reply.messageId) this.parentId = reply.messageId;
+    // An empty reply is announced with an id that is never stored, so keeping
+    // it would only produce a stale parent on the next turn.
+    if (reply.messageId && reply.text.trim() !== "") this.parentId = reply.messageId;
     return reply;
   }
 }
