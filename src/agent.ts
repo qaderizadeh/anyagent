@@ -88,7 +88,14 @@ export function runShell(command: string, cwd: string): Promise<ShellResult> {
 /* tool-call parsing                                                   */
 /* ------------------------------------------------------------------ */
 
-const LOOKS_LIKE_CALL = /tool_calls|<invoke|"name"\s*:\s*"shell"/;
+/** Zero-width characters a model sometimes injects into tag names. */
+const INVISIBLE = /[\u200b-\u200f\u2060\ufeff]/g;
+
+/**
+ * Loose on purpose: this guard stops raw tool markup being printed as an
+ * answer, so it must not depend on exact spelling ("< invoke", "< parameter").
+ */
+const LOOKS_LIKE_CALL = /tool_calls|<\s*invoke\b|<\s*parameter\b|"arguments"\s*:/i;
 
 function decodeEntities(text: string): string {
   return text
@@ -139,7 +146,11 @@ export function parseCommands(reply: string): string[] {
     if (command !== "" && !commands.includes(command)) commands.push(command);
   };
 
-  for (const variant of [reply, unescapeMarkup(decodeEntities(reply))]) {
+  const variants = [reply, unescapeMarkup(decodeEntities(reply))].map((text) =>
+    text.replace(INVISIBLE, ""),
+  );
+
+  for (const variant of variants) {
     if (!LOOKS_LIKE_CALL.test(variant)) continue;
 
     // {"command": "..."}
@@ -150,15 +161,15 @@ export function parseCommands(reply: string): string[] {
     for (const match of variant.matchAll(/"arguments"\s*:\s*(\{[\s\S]*?\})\s*}/g)) {
       add(commandFromJson(match[1]));
     }
-    // <parameter name="command">...</parameter>
+    // <parameter name="command">...</parameter>  (also "< parameter")
     for (const match of variant.matchAll(
-      /<parameter[^>]*name\s*=\s*"?command"?[^>]*>([\s\S]*?)<\/parameter>/g,
+      /<\s*parameter[^>]*name\s*=\s*"?command"?[^>]*>([\s\S]*?)<\s*\/\s*parameter\s*>/g,
     )) {
       add(decodeEntities(match[1]));
     }
     // <parameter name="arguments">{"command":"..."}</parameter>
     for (const match of variant.matchAll(
-      /<parameter[^>]*name\s*=\s*"?arguments"?[^>]*>([\s\S]*?)<\/parameter>/g,
+      /<\s*parameter[^>]*name\s*=\s*"?arguments"?[^>]*>([\s\S]*?)<\s*\/\s*parameter\s*>/g,
     )) {
       add(commandFromJson(decodeEntities(match[1])));
     }

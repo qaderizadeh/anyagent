@@ -76,12 +76,7 @@ const pending: Array<(line: string | null) => void> = [];
 let ended = false;
 
 function startInput(): void {
-  // Must run once. Registering the handlers on every ask() would attach an
-  // extra "line" listener per prompt, and every listener receives the same
-  // line: the first resolves the pending prompt, the rest queue it, so one
-  // typed line gets re-delivered to the next prompts (help printed twice, a
-  // finished task silently re-running).
-  if (rl) return;
+  if (rl) return; // once only: extra "line" listeners re-deliver every line
 
   rl = createInterface({
     input: process.stdin,
