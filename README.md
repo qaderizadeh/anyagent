@@ -11,7 +11,7 @@ Part of [anydev.ir](https://anydev.ir).
 ## How it works
 
 ```text
-your task -> DeepSeek -> shell call -> run bash -> result -> DeepSeek -> ... -> answer
+task -> DeepSeek -> {"text", "command"} -> run bash -> result -> DeepSeek -> ... -> text
 ```
 
 That is the whole program. Three files:
@@ -19,7 +19,7 @@ That is the whole program. Three files:
 | File | What it is |
 |---|---|
 | `src/deepseek.ts` | transport: credentials, proof-of-work, the six backend endpoints |
-| `src/agent.ts` | the loop, one `shell` tool, a small tool-call parser |
+| `src/agent.ts` | the loop, one bash command, one reply shape |
 | `src/cli.ts` | banner, session picker, REPL |
 
 ### No local state
@@ -108,20 +108,23 @@ Done. Created hello.txt with "Hello World".
 | `DEEPSEEK_SHELL_TIMEOUT_MS` | `120000` | per-command timeout |
 | `DEEPSEEK_POW_WASM_PATH` | `./sha3_wasm_bg.wasm` | proof-of-work binary |
 
-## Tool
+## The reply
 
-One tool, run one command at a time:
+The agent has exactly one answer shape. Every model turn is one JSON object
+with a note for you and one bash command:
 
 ```json
-{"tool_calls":[{"id":"1","type":"function","function":{"name":"shell","arguments":{"command":"ls -la"}}}]}
+{"text": "listing the directory", "command": "ls -la"}
 ```
 
-The result is returned to the model as
-`{"exitCode":0,"stdout":"...","stderr":"..."}`. A failing command does not
+One command per turn. The result goes back as
+`{"exitCode":0,"stdout":"...","stderr":"..."}`; a failing command does not
 stop the agent — the error goes back to the model, which decides what to do.
-The parser also accepts the XML-ish spellings the model sometimes emits
-(`<invoke name="shell"><parameter name="command">…</parameter></invoke>`),
-including JSON-escaped and HTML-escaped variants.
+
+An **empty or missing `command` means the turn is over**: the task is done, or
+the agent is blocked and needs you. Either way `text` is shown to you and the
+agent stops. If the reply is not this shape at all, the model is asked once to
+resend it, and the run stops rather than looping forever.
 
 ## Security
 

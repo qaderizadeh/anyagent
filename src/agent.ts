@@ -1,11 +1,11 @@
 /**
- * The agent: a loop, one tool, and a very small tool-call parser.
+ * The agent: a loop, one command, one answer shape.
  *
- *   task -> model -> tool call? -> run bash -> send result -> model -> ...
+ *   task -> model -> {"text": "...", "command": "..."} -> run bash -> ...
  *
  * Conversation state is not kept here. It lives in the chat session on
- * chat.deepseek.com; this process only carries the current prompt and the
- * message id to reply to.
+ * chat.deepseek.com; this process only carries the prompt and the message
+ * id to reply to.
  */
 
 import { exec } from "node:child_process";
@@ -20,34 +20,27 @@ import {
 const MAX_STEPS = intEnv("DEEPSEEK_MAX_ITERATIONS", 50);
 const SHELL_TIMEOUT_MS = intEnv("DEEPSEEK_SHELL_TIMEOUT_MS", 120_000);
 const MAX_OUTPUT_CHARS = 30_000;
+/** Extra attempts allowed for an empty or unreadable reply. */
+const MAX_RETRIES = 2;
 
 function intEnv(name: string, fallback: number): number {
   const value = Number(process.env[name]);
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
-/** Instructions sent as the first message of a new chat session. */
-export const TOOL_HEADER = [
-  "You are a command-line agent. You act on the user's computer with one tool:",
-  "  shell(command) - run one bash command in the working directory.",
-  "",
-  'To act, reply with ONLY this JSON, one command at a time:',
-  '{"tool_calls":[{"id":"1","type":"function","function":{"name":"shell","arguments":{"command":"ls -la"}}}]}',
-  "",
-  'Each result comes back as {"exitCode":0,"stdout":"...","stderr":"..."}.',
-  "Read it, then call the tool again or answer in plain text when the task is done.",
-  "Never claim you did something unless a tool result shows it succeeded.",
-  "Keep the final answer short.",
+/** The one answer shape. Sent with every task, so it wins over older history. */
+export const HEADER = [
+  "You are a command-line agent on the user's computer. Run one bash command at a time.",
+  "Always reply with one JSON object in exactly this shape and nothing else -",
+  "no prose, no markdown, no code fence:",
+  '{"text": "short note for the user", "command": "the bash command to run"}',
+  'Put "" in "command" when the task is done, or when you are blocked and need',
+  'the user to do something - explain that in "text".',
+  "Never claim something worked unless a command result showed it.",
 ].join("\n");
 
-const EMPTY_NUDGE =
-  'Your reply was empty. Either call the shell tool, or give your final answer as plain text.';
-const UNPARSEABLE_NUDGE =
-  "That tool call could not be parsed. Re-send it as valid JSON on a single line:\n" +
-  '{"tool_calls":[{"id":"1","type":"function","function":{"name":"shell","arguments":{"command":"..."}}}]}';
-
-/** Extra attempts allowed for an empty or unreadable reply. */
-const MAX_RETRIES = 2;
+const NUDGE =
+  'Reply with one JSON object only, nothing else: {"text": "...", "command": "..."} - an empty command means you are done.';
 
 export type ShellResult = {
   exitCode: number;
@@ -86,99 +79,41 @@ export function runShell(command: string, cwd: string): Promise<ShellResult> {
 }
 
 /* ------------------------------------------------------------------ */
-/* tool-call parsing                                                   */
+/* reply parsing                                                       */
 /* ------------------------------------------------------------------ */
 
-/** Zero-width characters a model sometimes injects into tag names. */
-const INVISIBLE = /[\u200b-\u200f\u2060\ufeff]/g;
+export type Reply = {
+  /** What to tell the user. */
+  text: string;
+  /** Empty means: done, blocked, or waiting for the user. */
+  command: string;
+};
 
-/**
- * Loose on purpose: this guard stops raw tool markup being printed as an
- * answer, so it must not depend on exact spelling ("< invoke", "< parameter").
- */
-const LOOKS_LIKE_CALL = /tool_calls|<\s*invoke\b|<\s*parameter\b|"arguments"\s*:/i;
-
-function decodeEntities(text: string): string {
-  return text
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&amp;/g, "&");
-}
-
-/** Undo the JSON escaping a model sometimes applies to the whole call. */
-function unescapeMarkup(text: string): string {
-  return text.replace(/\\(["'/\\])/g, "$1");
-}
-
-/** Read a command out of a JSON argument object (or a stringified one). */
-function commandFromJson(raw: string): string | null {
-  let parsed: unknown;
+function asObject(text: string): Record<string, unknown> | null {
   try {
-    parsed = JSON.parse(raw.trim());
+    const value: unknown = JSON.parse(text);
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
   } catch {
     return null;
   }
-  if (typeof parsed === "string") return parsed;
-  if (!parsed || typeof parsed !== "object") return null;
-
-  const object = parsed as Record<string, unknown>;
-  for (const key of ["command", "cmd", "script", "code"]) {
-    if (typeof object[key] === "string") return object[key] as string;
-  }
-  // The model sometimes wraps the whole argument object one level deep.
-  const nested = object["arguments"];
-  if (typeof nested === "string") return commandFromJson(nested);
-  if (nested && typeof nested === "object") return commandFromJson(JSON.stringify(nested));
-  return null;
 }
 
-/**
- * Extract the shell commands from a reply.
- *
- * Understands the plain JSON form plus the XML-ish spellings the model
- * occasionally falls back to, including JSON-escaped and HTML-escaped tags.
- */
-export function parseCommands(reply: string): string[] {
-  const commands: string[] = [];
-  const add = (value: string | null): void => {
-    const command = (value ?? "").trim();
-    if (command !== "" && !commands.includes(command)) commands.push(command);
-  };
+/** Read {"text","command"} out of a reply. Returns null if there is none. */
+export function parseReply(reply: string): Reply | null {
+  // Models like to wrap the object in a fence or in a sentence around it.
+  const body = reply.replace(/```[a-z]*\s*/gi, "").trim();
+  const start = body.indexOf("{");
+  const end = body.lastIndexOf("}");
+  const wrapped = start >= 0 && end > start ? body.slice(start, end + 1) : body;
+  const object = asObject(body) ?? asObject(wrapped);
+  if (object == null) return null;
 
-  const variants = [reply, unescapeMarkup(decodeEntities(reply))].map((text) =>
-    text.replace(INVISIBLE, ""),
-  );
+  const field = (value: unknown): string =>
+    typeof value === "string" ? value.trim() : "";
 
-  for (const variant of variants) {
-    if (!LOOKS_LIKE_CALL.test(variant)) continue;
-
-    // {"command": "..."}
-    for (const match of variant.matchAll(/"command"\s*:\s*"((?:[^"\\]|\\.)*)"/g)) {
-      add(commandFromJson(`"${match[1]}"`));
-    }
-    // {"arguments": {"command": "..."}}
-    for (const match of variant.matchAll(/"arguments"\s*:\s*(\{[\s\S]*?\})\s*}/g)) {
-      add(commandFromJson(match[1]));
-    }
-    // <parameter name="command">...</parameter>  (also "< parameter")
-    for (const match of variant.matchAll(
-      /<\s*parameter[^>]*name\s*=\s*"?command"?[^>]*>([\s\S]*?)<\s*\/\s*parameter\s*>/g,
-    )) {
-      add(decodeEntities(match[1]));
-    }
-    // <parameter name="arguments">{"command":"..."}</parameter>
-    for (const match of variant.matchAll(
-      /<\s*parameter[^>]*name\s*=\s*"?arguments"?[^>]*>([\s\S]*?)<\s*\/\s*parameter\s*>/g,
-    )) {
-      add(commandFromJson(decodeEntities(match[1])));
-    }
-
-    if (commands.length > 0) break;
-  }
-
-  return commands;
+  return { text: field(object["text"]), command: field(object["command"]) };
 }
 
 /* ------------------------------------------------------------------ */
@@ -216,42 +151,34 @@ export class Agent {
   }
 
   async run(task: string, events: AgentEvents = {}): Promise<string> {
-    let prompt = `${TOOL_HEADER}\n\n${task}`;
+    let prompt = `${HEADER}\n\nTask: ${task}`;
     let retries = 0;
 
     for (let step = 0; step < MAX_STEPS; step++) {
       const reply = await this.send(prompt, events);
-      const commands = parseCommands(reply.text);
+      const parsed = parseReply(reply.text);
 
-      if (commands.length === 0) {
-        const answer = reply.text.trim();
-
-        if (answer !== "" && !LOOKS_LIKE_CALL.test(answer)) return answer;
-
+      // No usable object, or one with nothing in it: ask once more, then stop.
+      if (parsed == null || (parsed.text === "" && parsed.command === "")) {
         retries += 1;
         if (retries > MAX_RETRIES) {
-          // Retrying again just burns model calls; DeepSeek is not answering.
           throw new Error(
-            answer === ""
-              ? "DeepSeek returned an empty reply twice in a row, so the task stopped here.\n" +
-                "The conversation is intact on chat.deepseek.com — send the task again, or use /new."
-              : "DeepSeek replied with tool markup that could not be read:\n" +
-                answer.slice(0, 300),
+            "DeepSeek did not send a usable reply, so the task stopped here.\n" +
+              "The conversation is intact on chat.deepseek.com - send the task again, or use /new.",
           );
         }
-        prompt = answer === "" ? EMPTY_NUDGE : UNPARSEABLE_NUDGE;
+        prompt = NUDGE;
         continue;
       }
 
+      // An empty command is the agent's way of saying it is done or blocked.
+      if (parsed.command === "") return parsed.text;
+
       retries = 0;
-      const results: ShellResult[] = [];
-      for (const command of commands) {
-        events.onTool?.(command);
-        const result = await runShell(command, this.cwd);
-        events.onToolResult?.(result);
-        results.push(result);
-      }
-      prompt = `Tool results:\n${JSON.stringify(results)}`;
+      events.onTool?.(parsed.command);
+      const result = await runShell(parsed.command, this.cwd);
+      events.onToolResult?.(result);
+      prompt = `Result:\n${JSON.stringify(result)}`;
     }
 
     return "Agent stopped: maximum iterations reached.";
