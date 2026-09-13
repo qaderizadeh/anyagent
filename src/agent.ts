@@ -167,16 +167,17 @@ export class Agent {
       const parsed = parseReply(raw);
 
       // Nothing usable came back. Two different faults, two different answers:
-      // an empty reply is the backend not answering, so ask the same thing
-      // again; a reply in some other shape is the model's, so ask for the shape.
+      // an empty reply is the connection or the backend (its answer, if any, was
+      // already looked up on chat.deepseek.com), so ask the same thing again; a
+      // reply in some other shape is the model's, so ask for the shape.
       if (parsed == null || (parsed.text === "" && parsed.command === "")) {
         if (raw === "") {
           quiet += 1;
           if (quiet > MAX_RETRIES) {
             throw new Error(
-              `DeepSeek sent an empty reply ${quiet} times in a row, so the task stopped here.\n` +
-                "Nothing came back from the model at all - this is a backend hiccup, not a tool failure.\n" +
-                "The last tool result is still the last message on the chat: send the task again, or use /new.",
+              `DeepSeek returned nothing ${quiet} times in a row, so the task stopped here.\n` +
+                "No reply arrived and none was stored on the backend, so there is nothing to recover.\n" +
+                "Your chat is intact on chat.deepseek.com - send the task again, or use /new.",
             );
           }
           await sleep(RETRY_DELAY_MS * quiet);

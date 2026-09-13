@@ -139,6 +139,11 @@ failure: an **empty reply** (the backend sent nothing at all, so the same
 prompt is retried after a short delay) or a **wrong shape** (the offending
 reply is printed).
 
+A dropped connection can end the stream before anything arrives, while DeepSeek
+carries on and stores the finished answer anyway. An empty turn is therefore
+looked up on chat.deepseek.com first and used if it is there, so a hiccup does
+not throw the model's work away.
+
 ## Security
 
 This agent runs **real bash commands** with your user's permissions, and its
@@ -161,6 +166,10 @@ working directory is wherever you point `--cwd`. There is no sandbox.
 - **Recovery.** If the message id the agent replies to no longer exists, it
   retries once without a parent; if the chat session itself was deleted on the
   web side, it starts a fresh one and tells you.
+- **Dropped connections.** When a turn comes back empty the agent does not
+  immediately ask again: it waits for the answer to show up in the chat's
+  history and uses that, since the backend finishes and stores it regardless.
+  A turn that was never stored is detected in a few seconds and retried.
 - `dist/` is build output and is not tracked, so run `npm run build` after
   every `git pull`.
 

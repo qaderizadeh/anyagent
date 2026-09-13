@@ -347,6 +347,36 @@ export async function history(session: Session, chatId: string): Promise<History
 }
 
 /* ------------------------------------------------------------------ */
+/* dropped connections                                                 */
+/* ------------------------------------------------------------------ */
+
+const sleep = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
+
+/**
+ * A cut connection returns nothing, while DeepSeek keeps generating and stores
+ * the finished answer on the backend anyway. So when a turn comes back empty,
+ * look for that answer before asking the model again.
+ *
+ * The message for the turn shows up in history straight away but stays empty
+ * until the generation finishes, so text means it is complete. When no message
+ * appears at all the turn was never stored, and there is nothing to recover.
+ */
+async function recoverAnswer(session: Session, chatId: string, afterId: number): Promise<Completion | null> {
+  for (let attempt = 0; attempt < 15; attempt++) {
+    await sleep(2_000);
+    const messages = await history(session, chatId).catch(() => []);
+    const turn = messages.filter((m) => m.role === "ASSISTANT" && m.id > afterId);
+    if (turn.length === 0) {
+      if (attempt >= 2) return null;
+      continue;
+    }
+    const answer = turn.filter((m) => m.content.trim() !== "").pop();
+    if (answer) return { text: answer.content, messageId: String(answer.id) };
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ */
 /* proof of work                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -564,6 +594,11 @@ export async function complete(session: Session, turn: Turn, wasmPath: string): 
     if (buffer !== "") handleLine(buffer);
   } finally {
     reader.cancel().catch(() => {});
+  }
+
+  if (text.trim() === "") {
+    const recovered = await recoverAnswer(session, turn.chatId, Number(turn.parentId) || 0);
+    if (recovered) return recovered;
   }
 
   return { text, messageId: messageId || undefined };
