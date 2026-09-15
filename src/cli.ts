@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * AnyAgent — a small CLI agent on chat.deepseek.com.
+ * AnyAgent - a small CLI agent on chat.deepseek.com.
  *
  *   anyagent                  pick a session (or start one) and chat
  *   anyagent "task"           run one task and exit
@@ -8,29 +8,19 @@
  *   anyagent --session ID     continue a specific session
  *   anyagent --cwd DIR        working directory for the commands
  *
- * Sessions and messages live on chat.deepseek.com. Nothing is stored locally
- * except the captured credentials in DEEPSEEK_SESSION_JSON.
+ * Everything runs through a real Chromium window with a persistent profile.
+ * Sign in there once; the profile keeps it. Sessions and messages live on
+ * chat.deepseek.com - nothing is stored locally.
  */
 
 import { createInterface } from "node:readline/promises";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { Agent, searchEnabled, shellName, thinkingEnabled } from "./agent.js";
-import {
-  BizError,
-  createSession,
-  history,
-  listSessions,
-  loadSession,
-  resolveWasmPath,
-  verifySession,
-  type ChatSession,
-  type Session,
-} from "./deepseek.js";const dim = (text: string): string => (process.stdout.isTTY ? `\x1b[2m${text}\x1b[0m` : text);
+import { Agent, shellName } from "./agent.js";
+import { Browser, modes, profileDir, type ChatSession } from "./browser.js";
 
-
-
+const dim = (text: string): string => (process.stdout.isTTY ? `\x1b[2m${text}\x1b[0m` : text);
 const bold = (text: string): string => (process.stdout.isTTY ? `\x1b[1m${text}\x1b[0m` : text);
 
 const HELP = `Commands:
@@ -47,8 +37,10 @@ Usage:
   anyagent --cwd DIR        working directory
 
 Env:
-  DEEPSEEK_SESSION_JSON / DEEPSEEK_SESSION_PATH   captured credentials
-  DEEPSEEK_MODEL_TYPE        backend model (default: backend default)
+  ANYAGENT_PROFILE_DIR       browser profile that holds the login (default ~/.anyagent/browser)
+  ANYAGENT_HEADLESS          "1" to hide the browser window (default: visible)
+  ANYAGENT_BROWSER_PATH      use this Chromium/Chrome instead of the bundled one
+  ANYAGENT_PACE_MS           pause before each prompt (default: 800)
   DEEPSEEK_THINKING_ENABLED  deep thinking (default: on)
   DEEPSEEK_SEARCH_ENABLED    web search (default: off)
   DEEPSEEK_MAX_ITERATIONS    loop limit (default: 50)
@@ -144,12 +136,6 @@ function printSessions(list: ChatSession[]): void {
   console.log("  [0] start a new session\n");
 }
 
-/** Newest message id in a chat session — the parent for the next turn. */
-async function tipOf(session: Session, chatId: string): Promise<number> {
-  const messages = await history(session, chatId).catch(() => []);
-  return messages.reduce((max, message) => Math.max(max, message.id), 0);
-}
-
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -166,20 +152,22 @@ async function main(): Promise<void> {
     throw new Error(`Working directory does not exist: ${cwd}`);
   }
 
-  const session = loadSession();
-  await verifySession(session);
+  const browser = await Browser.open((text) => console.log(dim(text)));
+  try {
+    await run(args, browser, cwd);
+  } finally {
+    await browser.close();
+  }
+}
 
-  const wasmPath = resolveWasmPath();
-  const list = await listSessions(session, 10);
-
-  let chatId: string;
-  let parentId = 0;
+async function run(args: Args, browser: Browser, cwd: string): Promise<void> {
+  const agent = new Agent(browser, cwd);
+  const list = await browser.listSessions(10);
 
   if (args.session != null) {
-    chatId = args.session;
-    parentId = await tipOf(session, chatId);
+    await agent.openSession(args.session);
   } else if (args.fresh || args.task != null) {
-    chatId = await createSession(session);
+    await agent.newSession();
   } else {
     if (list.length > 0) printSessions(list);
     const asked = await ask(list.length > 0 ? "Pick [0]: " : "Start a new session? [y]: ");
@@ -189,24 +177,24 @@ async function main(): Promise<void> {
       Number.isInteger(choice) && choice >= 1 && choice <= list.length
         ? list[choice - 1]!.id
         : undefined;
-    chatId = picked ?? (await createSession(session));
-    parentId = picked ? await tipOf(session, chatId) : 0;
+    if (picked === undefined) await agent.newSession();
+    else await agent.openSession(picked);
   }
 
+  const { thinking, search } = modes();
   console.log(bold("AnyAgent"));
   console.log("────────────────────────────");
-  console.log(`${dim("Backend:  ")} chat.deepseek.com (web session)`);
-  console.log(`${dim("Session:  ")} ${chatId}`);
-  console.log(`${dim("Thinking: ")} ${thinkingEnabled() ? "enabled" : "disabled"}`);
-  console.log(`${dim("Search:   ")} ${searchEnabled() ? "enabled" : "disabled"}`);
+  console.log(`${dim("Backend:  ")} chat.deepseek.com (Chromium)`);
+  console.log(`${dim("Profile:  ")} ${profileDir()}`);
+  console.log(`${dim("Session:  ")} ${agent.id || "(new chat)"}`);
+  console.log(`${dim("Thinking: ")} ${thinking ? "enabled" : "disabled"}`);
+  console.log(`${dim("Search:   ")} ${search ? "enabled" : "disabled"}`);
   console.log(`${dim("Shell:    ")} ${shellName()}`);
   console.log(`${dim("Directory:")} ${cwd}`);
   console.log();
   console.log(dim(`WARNING: this agent runs ${shellName()} commands and can modify files.`));
   console.log(dim("Only run it in a directory/environment you trust."));
   console.log();
-
-  const agent = new Agent(session, chatId, wasmPath, cwd, parentId || undefined);
 
   const runTask = async (task: string): Promise<void> => {
     const started = Date.now();
@@ -224,8 +212,6 @@ async function main(): Promise<void> {
           const reason = result.stderr.split("\n").find((line) => line.trim() !== "");
           if (result.exitCode !== 0 && reason) console.log(dim(`     ${oneLine(reason, 140)}`));
         },
-        onNewSession: () =>
-          console.log(dim("  ! the previous DeepSeek session was gone; started a new one")),
       });
     } finally {
       busy = false;
@@ -252,11 +238,7 @@ async function main(): Promise<void> {
         await runTask(input);
       } catch (error) {
         console.log();
-        console.log(
-          error instanceof BizError
-            ? `DeepSeek error (${error.code}): ${error.message}`
-            : errorText(error),
-        );
+        console.log(errorText(error));
         console.log(dim("Try again, or /exit to quit."));
       }
       continue;
@@ -272,13 +254,13 @@ async function main(): Promise<void> {
     }
 
     if (command === "new") {
-      agent.repoint(await createSession(session));
+      await agent.newSession();
       console.log(dim("Started a new DeepSeek session."));
       continue;
     }
 
     if (command === "sessions") {
-      const fresh = await listSessions(session);
+      const fresh = await browser.listSessions();
       if (fresh.length === 0) {
         console.log(dim("No sessions on the backend yet."));
         continue;
@@ -288,7 +270,7 @@ async function main(): Promise<void> {
       const choice = Number((asked ?? "0").trim());
       if (Number.isInteger(choice) && choice >= 1 && choice <= fresh.length) {
         const chosen = fresh[choice - 1]!;
-        agent.repoint(chosen.id, (await tipOf(session, chosen.id)) || undefined);
+        await agent.openSession(chosen.id);
         console.log(dim(`Continuing "${oneLine(chosen.title, 60)}".`));
       }
       continue;

@@ -1,7 +1,7 @@
 {
   "name": "anyagent",
-  "version": "1.0.0",
-  "description": "Personal CLI AI agent that talks directly to chat.deepseek.com — no API key, no browser automation",
+  "version": "2.0.0",
+  "description": "Personal CLI AI agent that drives chat.deepseek.com in a real browser — no API key, conversations stay on DeepSeek's side",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -19,7 +19,11 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prestart": "npm run build",
     "start": "node dist/cli.js"
+  },
+  "dependencies": {
+    "playwright": "^1.63.0"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

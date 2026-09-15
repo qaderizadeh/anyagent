@@ -3,28 +3,21 @@
  *
  *   task -> model -> {"text": "...", "command": "..."} -> run one command -> ...
  *
- * Conversation state is not kept here. It lives in the chat session on
- * chat.deepseek.com; this process only carries the prompt and the message
- * id to reply to.
+ * No conversation state lives here. The chat is the one open in the browser
+ * window, and everything in it stays on chat.deepseek.com.
  */
 
 import { exec } from "node:child_process";
 import { existsSync } from "node:fs";
 import * as path from "node:path";
-import {
-  BizError,
-  complete,
-  createSession,
-  type Completion,
-  type Session,
-} from "./deepseek.js";
+import type { Browser, Completion } from "./browser.js";
 
 const MAX_STEPS = intEnv("DEEPSEEK_MAX_ITERATIONS", 50);
 const SHELL_TIMEOUT_MS = intEnv("DEEPSEEK_SHELL_TIMEOUT_MS", 120_000);
 const MAX_OUTPUT_CHARS = 30_000;
 /** Extra attempts allowed for a reply we cannot use. */
 const MAX_RETRIES = 2;
-/** Wait before asking again when the backend sent nothing (it may be a hiccup). */
+/** Wait before asking again when nothing came back (it may be a hiccup). */
 const RETRY_DELAY_MS = 2_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
@@ -172,40 +165,35 @@ export type AgentEvents = {
   onText?: (text: string) => void;
   onTool?: (command: string) => void;
   onToolResult?: (result: ShellResult) => void;
-  /** The backend lost the chat session, so a fresh one was created. */
-  onNewSession?: (chatId: string) => void;
 };
 
 export class Agent {
-  private parentId?: number | string;
-
   constructor(
-    private readonly session: Session,
-    private chatId: string,
-    private readonly wasmPath: string,
+    private readonly browser: Browser,
     private readonly cwd: string,
-    parentId?: number | string,
-  ) {
-    this.parentId = parentId;
-  }
+  ) {}
 
   get id(): string {
-    return this.chatId;
+    return this.browser.currentChatId();
   }
 
-  /** Point this agent at another chat session (used by /new and /sessions). */
-  repoint(chatId: string, parentId?: number | string): void {
-    this.chatId = chatId;
-    this.parentId = parentId;
+  /** Continue an existing chat session. */
+  async openSession(chatId: string): Promise<void> {
+    await this.browser.openSession(chatId);
+  }
+
+  /** Start a new chat session. */
+  async newSession(): Promise<void> {
+    await this.browser.newSession();
   }
 
   async run(task: string, events: AgentEvents = {}): Promise<string> {
     let prompt = `${header()}\n\nTask: ${task}`;
-    let quiet = 0; // the backend answered with nothing
+    let quiet = 0; // nothing came back from the model
     let garbled = 0; // it answered, but not in the one shape we accept
 
     for (let step = 0; step < MAX_STEPS; step++) {
-      const reply = await this.send(prompt, events);
+      const reply: Completion = await this.browser.ask(prompt);
       const raw = reply.text.trim();
       const parsed = parseReply(raw);
 
@@ -218,7 +206,7 @@ export class Agent {
           quiet += 1;
           if (quiet > MAX_RETRIES) {
             throw new Error(
-              `DeepSeek returned nothing ${quiet} times in a row, so the task stopped here.\n` +
+              `Nothing came back from DeepSeek ${quiet} times in a row, so the task stopped here.\n` +
                 "No reply arrived and none was stored on the backend, so there is nothing to recover.\n" +
                 "Your chat is intact on chat.deepseek.com - send the task again, or use /new.",
             );
@@ -253,64 +241,4 @@ export class Agent {
 
     return "Agent stopped: maximum iterations reached.";
   }
-
-  /**
-   * One model turn. A stale message id or a chat session that no longer
-   * exists on the backend is recovered once, then the error is real.
-   */
-  private async send(prompt: string, events: AgentEvents): Promise<Completion> {
-    try {
-      return await this.completeTurn(prompt);
-    } catch (error) {
-      if (error instanceof BizError && error.code === 26) {
-        // The parent message id is gone from this chat; branch from the end.
-        this.parentId = undefined;
-        return this.completeTurn(prompt);
-      }
-      if (error instanceof BizError && error.code === 1) {
-        // The chat session itself was deleted on DeepSeek's side.
-        this.chatId = await createSession(this.session);
-        this.parentId = undefined;
-        events.onNewSession?.(this.chatId);
-        return this.completeTurn(
-          `(The previous chat session no longer exists, so this is a new one. Continue the task.)\n\n${prompt}`,
-        );
-      }
-      throw error;
-    }
-  }
-
-  private async completeTurn(prompt: string): Promise<Completion> {
-    const reply = await complete(
-      this.session,
-      {
-        chatId: this.chatId,
-        prompt,
-        parentId: this.parentId,
-        thinking: thinkingEnabled(),
-        search: searchEnabled(),
-        modelType: process.env["DEEPSEEK_MODEL_TYPE"] || undefined,
-      },
-      this.wasmPath,
-    );
-    // An empty reply is announced with an id that is never stored, so keeping
-    // it would only produce a stale parent on the next turn.
-    if (reply.messageId && reply.text.trim() !== "") this.parentId = reply.messageId;
-    return reply;
-  }
-}
-
-function boolEnv(name: string, fallback: boolean): boolean {
-  const raw = process.env[name];
-  if (raw == null || raw.trim() === "") return fallback;
-  return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
-}
-
-/** Deep thinking is on by default; web search is off by default. */
-export function thinkingEnabled(): boolean {
-  return boolEnv("DEEPSEEK_THINKING_ENABLED", true);
-}
-
-export function searchEnabled(): boolean {
-  return boolEnv("DEEPSEEK_SEARCH_ENABLED", false);
 }
