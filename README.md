@@ -54,7 +54,12 @@ Two things sit on disk, and neither is a conversation: your captured session
 ## Requirements
 
 - Node.js 20+
-- Chromium, installed once: `npx playwright install chromium`
+- A browser. AnyAgent uses a **Chrome, Edge or Chromium already on the
+  machine**, and only falls back to its own download when there is none:
+  `npx playwright install chromium`.
+
+  Firefox is not supported: Playwright can only drive its own patched build of
+  Firefox, so a Firefox you have installed cannot be used here.
 - A shell. Linux and macOS already have `bash`. On Windows AnyAgent uses a Git
   Bash if one is on your `PATH` and `cmd.exe` otherwise. Set `ANYAGENT_SHELL`
   to a path or a name to pick a different one.
@@ -63,7 +68,7 @@ Two things sit on disk, and neither is a conversation: your captured session
 
 ```bash
 npm install
-npx playwright install chromium     # once, downloads the browser
+npx playwright install chromium     # only if you have no Chrome, Edge or Chromium
 ```
 
 ### Capture your session
@@ -129,7 +134,7 @@ Done. Created hello.txt with "Hello World".
 | `DEEPSEEK_SESSION_JSON` | — | captured session as inline JSON |
 | `DEEPSEEK_SESSION_PATH` | — | path to a captured session file |
 | `ANYAGENT_HEADLESS` | `1` | `0` shows the browser window |
-| `ANYAGENT_BROWSER_PATH` | Playwright's Chromium | use your own Chrome or Edge binary |
+| `ANYAGENT_BROWSER_PATH` | auto-detected | a specific browser binary to use |
 | `ANYAGENT_PROFILE_DIR` | `~/.anyagent/browser` | browser profile, used when there is no credentials file |
 | `ANYAGENT_PACE_MS` | `300` | pause before each prompt: a fast person, not a machine |
 | `ANYAGENT_COMPLETION_TIMEOUT_MS` | `300000` | how long one turn may take |
@@ -180,6 +185,14 @@ never stored at all is detected within a few seconds and retried.
 
 ## Notes
 
+- **The browser is found for you.** AnyAgent uses a Chrome, Edge or Chromium
+  already on the machine, and only falls back to Playwright's own download when
+  there is none. The banner names the one it picked — `Backend: ... (Chromium,
+  hidden)` — so you can see what is actually running.
+- **A dead session is caught at startup.** The page can render a message box
+  from cached state after the session behind it has expired, so AnyAgent checks
+  with the backend before it starts. An expired capture gets the re-capture
+  message, not a failure halfway through a task.
 - **Nothing is typed.** The prompt goes into the composer in one go, the way a
   paste does, and Enter sends it. `ANYAGENT_PACE_MS` is the only delay, and it
   is short on purpose.

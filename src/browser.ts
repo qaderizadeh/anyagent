@@ -57,6 +57,103 @@ export function modes(): { thinking: boolean; search: boolean } {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* browser discovery                                                   */
+/* ------------------------------------------------------------------ */
+
+const IS_WINDOWS = process.platform === "win32";
+
+/** What we try to launch, in order. No `path` means Playwright's own browser. */
+type Candidate = { name: string; path?: string };
+
+function isFile(file: string): boolean {
+  try {
+    return fs.statSync(file).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function onPath(file: string): string | undefined {
+  for (const dir of (process.env["PATH"] ?? "").split(path.delimiter)) {
+    if (dir === "") continue;
+    const candidate = path.join(dir, file);
+    if (isFile(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+/** A friendly name for a browser binary, so the banner says what it is. */
+function nameFor(file: string): string {
+  const base = path.basename(file).toLowerCase();
+  if (base.includes("msedge")) return "Microsoft Edge";
+  if (base.includes("chromium")) return "Chromium";
+  if (base.includes("chrome")) return "Google Chrome";
+  return path.basename(file);
+}
+
+/**
+ * Browsers already installed on this machine, best first.
+ *
+ * Only Chromium-family browsers can be driven, so a system Firefox is of no
+ * use here: Playwright needs its own patched build, which is what
+ * `npx playwright install firefox` would download.
+ */
+function systemBrowsers(): Candidate[] {
+  const env = process.env;
+  const home = os.homedir();
+  const paths: Array<string | undefined> = [];
+
+  if (IS_WINDOWS) {
+    const at = (root: string | undefined, rest: string): string | undefined =>
+      root == null || root === "" ? undefined : path.join(root, rest);
+    paths.push(
+      at(env["PROGRAMFILES"], "Google/Chrome/Application/chrome.exe"),
+      at(env["PROGRAMFILES(X86)"], "Google/Chrome/Application/chrome.exe"),
+      at(env["LOCALAPPDATA"], "Google/Chrome/Application/chrome.exe"),
+      at(env["PROGRAMFILES(X86)"], "Microsoft/Edge/Application/msedge.exe"),
+      at(env["PROGRAMFILES"], "Microsoft/Edge/Application/msedge.exe"),
+      at(env["LOCALAPPDATA"], "Microsoft/Edge/Application/msedge.exe"),
+    );
+  } else if (process.platform === "darwin") {
+    paths.push(
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      path.join(home, "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+      "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+      "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    );
+  } else {
+    for (const name of [
+      "google-chrome",
+      "google-chrome-stable",
+      "chromium",
+      "chromium-browser",
+      "microsoft-edge",
+      "microsoft-edge-stable",
+    ]) {
+      paths.push(onPath(name));
+    }
+    paths.push("/opt/google/chrome/chrome", "/usr/bin/chromium", "/usr/bin/google-chrome");
+  }
+
+  const found: Candidate[] = [];
+  for (const file of paths) {
+    if (file == null || file === "" || !isFile(file)) continue;
+    if (found.some((candidate) => candidate.path === file)) continue;
+    found.push({ name: nameFor(file), path: file });
+  }
+  return found;
+}
+
+/**
+ * What to try, in order: the browser you configured, then the machine's own,
+ * then Playwright's own downloadable Chromium as the last resort.
+ */
+function launchOrder(configured: string): Candidate[] {
+  if (configured !== "") return [{ name: `${nameFor(configured)} (configured)`, path: configured }];
+  return [...systemBrowsers(), { name: "Chromium (bundled)" }];
+}
+
 /** Where the persistent browser profile lives - this is the login. */
 export function profileDir(): string {
   const configured = (process.env["ANYAGENT_PROFILE_DIR"] ?? "").trim();
@@ -190,12 +287,13 @@ function launchReason(error: unknown): string {
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line !== "");
-  return (
+  const line =
     lines.find((line) =>
       /shared librar|cannot open|Executable doesn't exist|permission denied|no such file/i.test(line),
-    ) ?? lines[0] ??
-    message
-  );
+    ) ??
+    lines[0] ??
+    message;
+  return line.replace(/^\[pid=\d+\]\[err]\s*/, "");
 }
 
 /** Request-header cookies, ready for the browser. */
@@ -256,36 +354,63 @@ export class Browser {
     fs.mkdirSync(dir, { recursive: true });
     const credentials = loadCredentials();
     const headless = boolEnv("ANYAGENT_HEADLESS", true);
-    const executable = (process.env["ANYAGENT_BROWSER_PATH"] ?? "").trim();
+    const configured = (process.env["ANYAGENT_BROWSER_PATH"] ?? "").trim();
 
-    let context: BrowserContext;
-    try {
-      context = await chromium.launchPersistentContext(dir, {
-        headless,
-        executablePath: executable === "" ? undefined : executable,
-        viewport: null,
-        locale: "en-US",
-        // Chromium announces automated sessions by default; a person's does not.
-        args: ["--disable-blink-features=AutomationControlled"],
-      });
-    } catch (error) {
+    const failures: string[] = [];
+    let context: BrowserContext | undefined;
+    let chosen = "";
+
+    for (const attempt of launchOrder(configured)) {
+      try {
+        context = await chromium.launchPersistentContext(dir, {
+          headless,
+          executablePath: attempt.path,
+          viewport: null,
+          locale: "en-US",
+          // Chromium announces automated sessions by default; a person's does not.
+          args: ["--disable-blink-features=AutomationControlled"],
+        });
+        chosen = attempt.name;
+        break;
+      } catch (error) {
+        const raw = error instanceof Error ? error.message : String(error);
+        if (/ProcessSingleton|SingletonLock/i.test(raw)) {
+          throw new Error(
+            `The browser profile is already in use: ${dir}\n` +
+              "Close the other AnyAgent (or the browser using that profile) and try again.",
+          );
+        }
+        const reason = /Executable doesn't exist/i.test(raw) ? "not installed" : launchReason(error);
+        failures.push(`${attempt.name}: ${reason}`);
+      }
+    }
+
+    if (context === undefined) {
       throw new Error(
-        `Could not start Chromium: ${launchReason(error)}\n\n` +
-          "Install the browser once with:  npx playwright install chromium\n" +
-          "If another copy is using the profile, close it and try again.\n" +
+        "Could not start a browser.\n\n" +
+          (failures.length > 0 ? `Tried:\n${failures.map((line) => `  ${line}`).join("\n")}\n\n` : "") +
+          "Install one with:\n  npx playwright install chromium\n\n" +
+          "AnyAgent also drives a Chrome, Edge or Chromium already on the machine,\n" +
+          "and ANYAGENT_BROWSER_PATH picks a browser by hand.\n" +
           `Profile: ${dir}`,
       );
     }
 
     const page = context.pages()[0] ?? (await context.newPage());
     const browser = new Browser(context, page);
-    browser.mode = headless ? "Chromium, hidden" : "Chromium, window";
+    browser.mode = `${chosen}, ${headless ? "hidden" : "window"}`;
     browser.login = credentials === null ? `browser profile (${dir})` : credentials.source;
-    if (credentials !== null) await browser.seed(credentials);
-    await browser.installModes();
-    await page.goto(`${HOST}/`, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await browser.ensureSignedIn(log, credentials);
-    return browser;
+    try {
+      if (credentials !== null) await browser.seed(credentials);
+      await browser.installModes();
+      await page.goto(`${HOST}/`, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      await browser.ensureSignedIn(log, credentials);
+      return browser;
+    } catch (error) {
+      // A failed start must not leave a browser holding the profile lock.
+      await browser.close();
+      throw error;
+    }
   }
 
   /**
@@ -342,8 +467,20 @@ export class Browser {
     });
   }
 
+  /**
+   * The page renders a composer from cached state even when the session behind
+   * it is dead, so signed in means the backend accepts the session too.
+   */
+  private async accountWorks(): Promise<boolean> {
+    try {
+      return json(await this.api("/api/v0/users/current"))["code"] === 0;
+    } catch {
+      return false;
+    }
+  }
+
   private async ensureSignedIn(log: (text: string) => void, credentials: Credentials | null): Promise<void> {
-    if (await this.signedIn(15_000)) return;
+    if ((await this.signedIn(15_000)) && (await this.accountWorks())) return;
 
     if (credentials !== null) {
       throw new Error(
@@ -362,11 +499,14 @@ export class Browser {
       );
     }
     log("Not signed in. Sign in at chat.deepseek.com in the browser window - anyagent carries on by itself.");
-    if (!(await this.signedIn(LOGIN_TIMEOUT_MS))) {
-      throw new Error(
-        `Still not signed in after ${Math.round(LOGIN_TIMEOUT_MS / 1000)}s. Run anyagent again when you are ready.`,
-      );
+    const deadline = Date.now() + LOGIN_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if ((await this.signedIn(2_000)) && (await this.accountWorks())) return;
+      await sleep(1_000);
     }
+    throw new Error(
+      `Still not signed in after ${Math.round(LOGIN_TIMEOUT_MS / 1000)}s. Run anyagent again when you are ready.`,
+    );
   }
 
   /** Signed in means the message box is on the page. */

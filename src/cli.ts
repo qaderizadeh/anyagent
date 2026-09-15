@@ -42,7 +42,7 @@ Env:
   DEEPSEEK_SESSION_JSON      captured authorization + cookie (or DEEPSEEK_SESSION_PATH)
   ANYAGENT_PROFILE_DIR       browser profile, used when there is no credentials file
   ANYAGENT_HEADLESS          "0" to show the browser window (default: hidden)
-  ANYAGENT_BROWSER_PATH      use this Chromium/Chrome instead of the bundled one
+  ANYAGENT_BROWSER_PATH      pick a browser by hand (default: any Chrome, Edge or Chromium found)
   ANYAGENT_PACE_MS           pause before each prompt (default: 300)
   DEEPSEEK_THINKING_ENABLED  deep thinking (default: on)
   DEEPSEEK_SEARCH_ENABLED    web search (default: off)
