@@ -6,7 +6,7 @@
  *   anyagent "task"           run one task and exit
  *   anyagent --new            force a brand-new session
  *   anyagent --session ID     continue a specific session
- *   anyagent --cwd DIR        working directory for bash commands
+ *   anyagent --cwd DIR        working directory for the commands
  *
  * Sessions and messages live on chat.deepseek.com. Nothing is stored locally
  * except the captured credentials in DEEPSEEK_SESSION_JSON.
@@ -16,7 +16,7 @@ import { createInterface } from "node:readline/promises";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { Agent, searchEnabled, thinkingEnabled } from "./agent.js";
+import { Agent, searchEnabled, shellName, thinkingEnabled } from "./agent.js";
 import {
   BizError,
   createSession,
@@ -52,6 +52,7 @@ Env:
   DEEPSEEK_THINKING_ENABLED  deep thinking (default: on)
   DEEPSEEK_SEARCH_ENABLED    web search (default: off)
   DEEPSEEK_MAX_ITERATIONS    loop limit (default: 50)
+  ANYAGENT_SHELL             shell to run commands in (default: bash, cmd.exe on Windows)
   DEEPSEEK_SHELL_TIMEOUT_MS  command timeout (default: 120000)`;
 
 type Args = {
@@ -198,9 +199,10 @@ async function main(): Promise<void> {
   console.log(`${dim("Session:  ")} ${chatId}`);
   console.log(`${dim("Thinking: ")} ${thinkingEnabled() ? "enabled" : "disabled"}`);
   console.log(`${dim("Search:   ")} ${searchEnabled() ? "enabled" : "disabled"}`);
+  console.log(`${dim("Shell:    ")} ${shellName()}`);
   console.log(`${dim("Directory:")} ${cwd}`);
   console.log();
-  console.log(dim("WARNING: this agent runs bash commands and can modify files."));
+  console.log(dim(`WARNING: this agent runs ${shellName()} commands and can modify files.`));
   console.log(dim("Only run it in a directory/environment you trust."));
   console.log();
 
@@ -216,8 +218,12 @@ async function main(): Promise<void> {
           if (text !== "") console.log(dim(`  · ${oneLine(text, 200)}`));
         },
         onTool: (command) => console.log(dim(`  -> shell: ${oneLine(command, 120)}`)),
-        onToolResult: (result) =>
-          console.log(dim(`     ${result.exitCode === 0 ? "ok" : `exit ${result.exitCode}`}`)),
+        onToolResult: (result) => {
+          console.log(dim(`     ${result.exitCode === 0 ? "ok" : `exit ${result.exitCode}`}`));
+          // Show why it failed - a shell that never started is otherwise silent.
+          const reason = result.stderr.split("\n").find((line) => line.trim() !== "");
+          if (result.exitCode !== 0 && reason) console.log(dim(`     ${oneLine(reason, 140)}`));
+        },
         onNewSession: () =>
           console.log(dim("  ! the previous DeepSeek session was gone; started a new one")),
       });

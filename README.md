@@ -3,7 +3,7 @@
 A small command-line AI agent that talks directly to **chat.deepseek.com**
 using your own browser session — no API key, no browser automation.
 
-It runs bash commands on your machine and keeps **every conversation on
+It runs shell commands on your machine and keeps **every conversation on
 DeepSeek's side**. Nothing is stored locally.
 
 Part of [anydev.ir](https://anydev.ir).
@@ -11,7 +11,7 @@ Part of [anydev.ir](https://anydev.ir).
 ## How it works
 
 ```text
-task -> DeepSeek -> {"text", "command"} -> run bash -> result -> DeepSeek -> ... -> text
+task -> DeepSeek -> {"text", "command"} -> run one command -> result -> DeepSeek -> ... -> text
 ```
 
 That is the whole program. Three files:
@@ -19,7 +19,7 @@ That is the whole program. Three files:
 | File | What it is |
 |---|---|
 | `src/deepseek.ts` | transport: credentials, proof-of-work, the six backend endpoints |
-| `src/agent.ts` | the loop, one bash command, one reply shape |
+| `src/agent.ts` | the loop, one shell command, one reply shape |
 | `src/cli.ts` | banner, session picker, REPL |
 
 ### No local state
@@ -36,7 +36,9 @@ which is git-ignored.
 ## Requirements
 
 - Node.js 20+
-- `bash` (Linux, macOS, WSL, Git Bash)
+- A shell. Linux and macOS already have `bash`. On Windows AnyAgent uses a Git
+  Bash if one is on your `PATH` and `cmd.exe` otherwise. Set `ANYAGENT_SHELL`
+  to a path or a name to pick a different one.
 
 ## Setup
 
@@ -101,6 +103,7 @@ Done. Created hello.txt with "Hello World".
 |---|---|---|
 | `DEEPSEEK_SESSION_JSON` | — | credentials as inline JSON |
 | `DEEPSEEK_SESSION_PATH` | — | path to a credentials file |
+| `ANYAGENT_SHELL` | `bash`, or `cmd.exe` on Windows | shell commands run in |
 | `DEEPSEEK_MODEL_TYPE` | backend default | e.g. `deepseek-reasoner` |
 | `DEEPSEEK_THINKING_ENABLED` | `1` | deep thinking |
 | `DEEPSEEK_SEARCH_ENABLED` | `0` | web search |
@@ -111,7 +114,7 @@ Done. Created hello.txt with "Hello World".
 ## The reply
 
 The agent has exactly one answer shape. Every model turn is one JSON object
-with a note for you and one bash command:
+with a note for you and one command:
 
 ```json
 {"text": "listing the directory", "command": "ls -la"}
@@ -146,7 +149,7 @@ not throw the model's work away.
 
 ## Security
 
-This agent runs **real bash commands** with your user's permissions, and its
+This agent runs **real shell commands** with your user's permissions, and its
 working directory is wherever you point `--cwd`. There is no sandbox.
 
 - Only run it in a directory/environment you trust.
@@ -170,6 +173,9 @@ working directory is wherever you point `--cwd`. There is no sandbox.
   immediately ask again: it waits for the answer to show up in the chat's
   history and uses that, since the backend finishes and stores it regardless.
   A turn that was never stored is detected in a few seconds and retried.
+- **Windows.** A Git Bash is used when one is on your `PATH`, `cmd.exe`
+  otherwise. The agent is told which shell it is in, so it writes commands for
+  that shell. `--cwd` takes a normal Windows path (`--cwd C:\projects\app`).
 - `dist/` is build output and is not tracked, so run `npm run build` after
   every `git pull`.
 

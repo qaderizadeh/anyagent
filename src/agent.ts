@@ -1,7 +1,7 @@
 /**
  * The agent: a loop, one command, one answer shape.
  *
- *   task -> model -> {"text": "...", "command": "..."} -> run bash -> ...
+ *   task -> model -> {"text": "...", "command": "..."} -> run one command -> ...
  *
  * Conversation state is not kept here. It lives in the chat session on
  * chat.deepseek.com; this process only carries the prompt and the message
@@ -9,6 +9,8 @@
  */
 
 import { exec } from "node:child_process";
+import { existsSync } from "node:fs";
+import * as path from "node:path";
 import {
   BizError,
   complete,
@@ -32,16 +34,46 @@ function intEnv(name: string, fallback: number): number {
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
+const IS_WINDOWS = process.platform === "win32";
+const OS_NAME = IS_WINDOWS ? "Windows" : process.platform === "darwin" ? "macOS" : "Linux";
+
+/**
+ * The shell commands run in: bash where it exists, the Windows command
+ * interpreter otherwise. Set ANYAGENT_SHELL to a path or a name to override.
+ */
+export function resolveShell(): string {
+  const configured = (process.env["ANYAGENT_SHELL"] ?? "").trim();
+  if (configured !== "") return configured;
+  if (IS_WINDOWS) return onPath("bash.exe") ?? process.env["COMSPEC"] ?? "cmd.exe";
+  return "/bin/bash";
+}
+
+function onPath(file: string): string | undefined {
+  for (const dir of (process.env["PATH"] ?? "").split(path.delimiter)) {
+    if (dir !== "" && existsSync(path.join(dir, file))) return path.join(dir, file);
+  }
+  return undefined;
+}
+
+/** The shell's short name, so the model writes commands that actually run. */
+export function shellName(): string {
+  const file = resolveShell().split(/[\\/]/).pop() ?? "";
+  return file.replace(/\.exe$/i, "");
+}
+
 /** The one answer shape. Sent with every task, so it wins over older history. */
-export const HEADER = [
-  "You are a command-line agent on the user's computer. Run one bash command at a time.",
-  "Always reply with one JSON object in exactly this shape and nothing else -",
-  "no prose, no markdown, no code fence:",
-  '{"text": "short note for the user", "command": "the bash command to run"}',
-  'Put "" in "command" when the task is done, or when you are blocked and need',
-  'the user to do something - explain that in "text".',
-  "Never claim something worked unless a command result showed it.",
-].join("\n");
+export function header(): string {
+  const shell = shellName();
+  return [
+    `You are a command-line agent on the user's ${OS_NAME} computer. Commands run in ${shell}, one at a time.`,
+    "Always reply with one JSON object in exactly this shape and nothing else -",
+    "no prose, no markdown, no code fence:",
+    `{"text": "short note for the user", "command": "the ${shell} command to run"}`,
+    'Put "" in "command" when the task is done, or when you are blocked and need',
+    'the user to do something - explain that in "text".',
+    "Never claim something worked unless a command result showed it.",
+  ].join("\n");
+}
 
 const NUDGE =
   'Reply with one JSON object only, nothing else: {"text": "...", "command": "..."} - an empty command means you are done.';
@@ -61,21 +93,32 @@ function clip(text: string): string {
   return `${text.slice(0, MAX_OUTPUT_CHARS)}\n... [truncated ${text.length - MAX_OUTPUT_CHARS} chars]`;
 }
 
-/** Run one bash command and always resolve with its exit code and output. */
+/** Run one shell command and always resolve with its exit code and output. */
 export function runShell(command: string, cwd: string): Promise<ShellResult> {
   return new Promise((resolve) => {
     exec(
       command,
-      { cwd, shell: "/bin/bash", timeout: SHELL_TIMEOUT_MS, killSignal: "SIGKILL", maxBuffer: 16 * 1024 * 1024 },
+      {
+        cwd,
+        shell: resolveShell(),
+        timeout: SHELL_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+        maxBuffer: 16 * 1024 * 1024,
+      },
       (error, stdout, stderr) => {
         const failure = error as (Error & { code?: number | string; killed?: boolean }) | null;
         const exitCode =
           failure == null ? 0 : typeof failure.code === "number" ? failure.code : 1;
-        const killed = failure?.killed ? `\n[killed after ${SHELL_TIMEOUT_MS}ms]` : "";
+        // A shell that never started reports itself only in the error, so keep
+        // that too - otherwise the failure is just "exit 1" with no reason.
+        const missing = failure != null && typeof failure.code === "string" ? failure.message : "";
+        const killed = failure?.killed ? `[killed after ${SHELL_TIMEOUT_MS}ms]` : "";
         resolve({
           exitCode,
           stdout: clip(String(stdout)),
-          stderr: clip(String(stderr) + killed),
+          stderr: clip(
+            [String(stderr).trim(), missing, killed].filter((part) => part !== "").join("\n"),
+          ),
         });
       },
     );
@@ -157,7 +200,7 @@ export class Agent {
   }
 
   async run(task: string, events: AgentEvents = {}): Promise<string> {
-    let prompt = `${HEADER}\n\nTask: ${task}`;
+    let prompt = `${header()}\n\nTask: ${task}`;
     let quiet = 0; // the backend answered with nothing
     let garbled = 0; // it answered, but not in the one shape we accept
 
