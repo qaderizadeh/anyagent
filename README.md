@@ -1,7 +1,8 @@
 # AnyAgent
 
 A small command-line AI agent that drives **chat.deepseek.com** in a real
-browser — no API key, no credentials file.
+browser — hidden by default, signed in with the same `authorization` + `cookie`
+pair you would capture for the API.
 
 It runs shell commands on your machine and keeps **every conversation on
 DeepSeek's side**. Nothing is stored locally.
@@ -14,10 +15,10 @@ AnyAgent used to call DeepSeek's API directly from Node. That works, but the
 requests had a script's fingerprint and went out far faster than a person
 could type — and the account was flagged for it.
 
-So it now drives the site the way you would: it opens Chromium with a
-persistent profile, types the prompt into the message box, presses Enter, and
-reads DeepSeek's own `/chat/completion` response off the wire. Requests carry a
-real browser, a real session and a human pace.
+So the requests now come from Chromium: the prompt is put into the real
+composer and sent, and DeepSeek's own `/chat/completion` response is read off
+the wire. Same captured session as before, a real browser's fingerprint and a
+human pace.
 
 The direct-HTTP version is kept, unchanged and working, on branch **`direct-api`**
 and tag **`v1.0.0`**:
@@ -36,19 +37,19 @@ That is the whole program. Three files:
 
 | File | What it is |
 |---|---|
-| `src/browser.ts` | transport: the browser window, the composer, the session list, reading the reply |
+| `src/browser.ts` | transport: the browser, the captured session, the composer, the session list, reading the reply |
 | `src/agent.ts` | the loop, one shell command, one reply shape |
 | `src/cli.ts` | banner, session picker, REPL |
 
 ### No local state
 
-The chat that is open in the browser window is the conversation. Sessions and
-messages live on chat.deepseek.com, so you can close the terminal, run AnyAgent
-on another machine, or edit the conversation on the website — it is the same
+The chat that is open in the browser is the conversation. Sessions and messages
+live on chat.deepseek.com, so you can close the terminal, run AnyAgent on
+another machine, or edit the conversation on the website — it is the same
 conversation.
 
-The one thing on disk is the browser profile (`~/.anyagent/browser` by
-default), which holds your login. Nothing else is written.
+Two things sit on disk, and neither is a conversation: your captured session
+(`DEEPSEEK_SESSION_JSON`, git-ignored) and the browser profile.
 
 ## Requirements
 
@@ -63,12 +64,33 @@ default), which holds your login. Nothing else is written.
 ```bash
 npm install
 npx playwright install chromium     # once, downloads the browser
-npm start
 ```
 
-On the first run a Chromium window opens at chat.deepseek.com. **Sign in there
-once** — AnyAgent waits and then carries on by itself. The profile keeps the
-login, so later runs go straight to the prompt.
+### Capture your session
+
+1. Open <https://chat.deepseek.com> and sign in.
+2. Open DevTools → **Network**, and click any request to `/api/v0/...`
+   (`create_pow_challenge` is a good pick).
+3. Under **Request Headers**, copy the values of `authorization` and `cookie`.
+4. Save them next to the project as `DEEPSEEK_SESSION_JSON`:
+
+```json
+{
+  "authorization": "Bearer <token>",
+  "cookie": "ds_session_id=<...>; ..."
+}
+```
+
+That is all AnyAgent needs — the same pair the direct-HTTP version used.
+(`token` is accepted as an alias for `authorization`, and `cookies` for
+`cookie`; a cookie name→value map works too.)
+
+> Re-capture when DeepSeek signs you out. The `aws-waf-token` cookie inside
+> `cookie` is usually the one that expires first.
+
+**Or sign in by hand instead.** With no credentials file, AnyAgent uses the
+browser profile: run once with `ANYAGENT_HEADLESS=0`, sign in in the window
+that opens, and every later run is signed in already.
 
 ## Usage
 
@@ -104,12 +126,14 @@ Done. Created hello.txt with "Hello World".
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ANYAGENT_PROFILE_DIR` | `~/.anyagent/browser` | browser profile — this holds the login |
-| `ANYAGENT_HEADLESS` | `0` | `1` hides the window (see the note below) |
+| `DEEPSEEK_SESSION_JSON` | — | captured session as inline JSON |
+| `DEEPSEEK_SESSION_PATH` | — | path to a captured session file |
+| `ANYAGENT_HEADLESS` | `1` | `0` shows the browser window |
 | `ANYAGENT_BROWSER_PATH` | Playwright's Chromium | use your own Chrome or Edge binary |
-| `ANYAGENT_PACE_MS` | `800` | pause before each prompt, so turns are not fired back to back |
-| `ANYAGENT_LOGIN_TIMEOUT_MS` | `300000` | how long to wait for you to sign in |
+| `ANYAGENT_PROFILE_DIR` | `~/.anyagent/browser` | browser profile, used when there is no credentials file |
+| `ANYAGENT_PACE_MS` | `300` | pause before each prompt: a fast person, not a machine |
 | `ANYAGENT_COMPLETION_TIMEOUT_MS` | `300000` | how long one turn may take |
+| `ANYAGENT_LOGIN_TIMEOUT_MS` | `300000` | how long to wait for a hand sign-in |
 | `ANYAGENT_SHELL` | `bash`, or `cmd.exe` on Windows | shell commands run in |
 | `DEEPSEEK_THINKING_ENABLED` | `1` | deep thinking |
 | `DEEPSEEK_SEARCH_ENABLED` | `0` | web search |
@@ -156,20 +180,17 @@ never stored at all is detected within a few seconds and retried.
 
 ## Notes
 
+- **Nothing is typed.** The prompt goes into the composer in one go, the way a
+  paste does, and Enter sends it. `ANYAGENT_PACE_MS` is the only delay, and it
+  is short on purpose.
 - **Thinking and search** are per-message switches in the composer. AnyAgent
   sets them on the completion request itself rather than clicking a button
   whose markup it would have to guess at, so `DEEPSEEK_THINKING_ENABLED` and
-  `DEEPSEEK_SEARCH_ENABLED` still apply to every turn.
-- **Typing is real.** The prompt is entered into the composer and sent, so the
-  request is the one the site itself makes: its headers, its proof of work, its
-  browser fingerprint.
+  `DEEPSEEK_SEARCH_ENABLED` apply to every turn.
 - **Reads** (the session list, a chat's history) go through the page's own
   `fetch`, so they carry the browser's session too. Only the reply is read off
   the wire.
-- **Headless** works if the profile is already signed in
-  (`ANYAGENT_HEADLESS=1`), but the whole point is to look like a normal
-  browser, so the window is visible by default.
-- **One window at a time.** The profile is locked while AnyAgent runs, so
+- **One browser at a time.** The profile is locked while AnyAgent runs, so
   don't start a second copy against the same profile.
 - `dist/` is build output and is not tracked, but `npm start` compiles first,
   so `git pull && npm start` is always up to date.
@@ -181,7 +202,8 @@ working directory is wherever you point `--cwd`. There is no sandbox.
 
 - Only run it in a directory/environment you trust.
 - It never listens on a network port and exposes no service.
-- The browser profile is equivalent to your DeepSeek login. Keep it private.
+- `DEEPSEEK_SESSION_JSON` is equivalent to your DeepSeek login — keep it out of
+  version control (it is already in `.gitignore`).
 - Commands run one at a time, so you can interrupt with Ctrl+C.
 
 ## License

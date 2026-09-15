@@ -1,15 +1,18 @@
 /**
  * DeepSeek transport, driven through a real browser.
  *
- * The agent never calls chat.deepseek.com itself. It drives the site in a
- * Chromium window with a persistent profile, the way a person would: it types
- * the prompt into the composer, presses Enter, and reads DeepSeek's own
- * /chat/completion response off the wire. No credentials are stored by this
- * project - the login lives in the browser profile.
+ * The agent never calls chat.deepseek.com itself. It drives the site in a real
+ * Chromium the way a person would: it pastes the prompt into the composer,
+ * presses Enter, and reads DeepSeek's own /chat/completion response off the
+ * wire. Requests therefore carry a browser's fingerprint and a human pace
+ * instead of a script's.
  *
- * Requests therefore carry a real browser fingerprint and a human pace instead
- * of a script's. The direct-HTTP version is kept on branch `direct-api` and
- * tag `v1.0.0`.
+ * The sign-in comes from DEEPSEEK_SESSION_JSON - the same captured
+ * authorization + cookie pair the direct-HTTP version used - seeded into the
+ * browser before the page's own scripts run. With no credentials file the
+ * browser profile is used instead, and you sign in once in a visible window.
+ *
+ * The direct-HTTP version is kept on branch `direct-api` and tag `v1.0.0`.
  */
 
 import * as fs from "node:fs";
@@ -24,8 +27,8 @@ const CHAT_URL = /\/a\/chat\/s\/([0-9a-z-]{8,})/i;
 
 const LOGIN_TIMEOUT_MS = intEnv("ANYAGENT_LOGIN_TIMEOUT_MS", 300_000);
 const COMPLETION_TIMEOUT_MS = intEnv("ANYAGENT_COMPLETION_TIMEOUT_MS", 300_000);
-/** A pause before each prompt, so turns are not fired back to back. */
-const PACE_MS = intEnv("ANYAGENT_PACE_MS", 800);
+/** A short pause before each prompt: a fast person, not a machine. */
+const PACE_MS = intEnv("ANYAGENT_PACE_MS", 300);
 
 export type ChatSession = {
   id: string;
@@ -71,6 +74,143 @@ function boolEnv(name: string, fallback: boolean): boolean {
   return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
 }
 
+/* ------------------------------------------------------------------ */
+/* credentials                                                         */
+/* ------------------------------------------------------------------ */
+
+export type Credentials = {
+  token: string;
+  cookie: string;
+  /** Where they came from, for the banner. */
+  source: string;
+};
+
+const SESSION_FILE = "DEEPSEEK_SESSION_JSON";
+
+function bareToken(raw: unknown): string {
+  let value = String(raw ?? "").trim().replace(/^bearer\s+/i, "");
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (parsed !== null && typeof parsed === "object") {
+      const inner = (parsed as Record<string, unknown>)["value"];
+      if (typeof inner === "string") value = inner;
+    }
+  } catch {
+    // already a bare token
+  }
+  return value;
+}
+
+/** A cookie map, a JSON string of one, or the raw request header. */
+function cookieHeader(raw: unknown): string {
+  const fromMap = (map: object): string =>
+    Object.entries(map)
+      .filter(([key, value]) => key !== "" && value != null && String(value) !== "")
+      .map(([key, value]) => `${key}=${String(value)}`)
+      .join("; ");
+
+  if (raw == null) return "";
+  if (typeof raw === "object") return fromMap(raw);
+  const value = String(raw).trim();
+  if (value.startsWith("{")) {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      if (parsed !== null && typeof parsed === "object") return fromMap(parsed as object);
+    } catch {
+      // a raw header value
+    }
+  }
+  return value;
+}
+
+/**
+ * The captured session, from DEEPSEEK_SESSION_JSON (inline), DEEPSEEK_SESSION_PATH
+ * (a file), or ./DEEPSEEK_SESSION_JSON. Null when there is none at all.
+ *
+ * `token` and `cookies` are accepted as aliases, and a cookie name->value map
+ * works too, so an old capture keeps working.
+ */
+export function loadCredentials(): Credentials | null {
+  const sources: Array<{ label: string; read: () => string }> = [
+    { label: "DEEPSEEK_SESSION_JSON", read: () => process.env["DEEPSEEK_SESSION_JSON"] ?? "" },
+    {
+      label: "DEEPSEEK_SESSION_PATH",
+      read: () =>
+        fs.readFileSync(path.resolve(process.cwd(), process.env["DEEPSEEK_SESSION_PATH"] ?? ""), "utf8"),
+    },
+    { label: SESSION_FILE, read: () => fs.readFileSync(path.resolve(process.cwd(), SESSION_FILE), "utf8") },
+  ];
+
+  for (const entry of sources) {
+    let text = "";
+    try {
+      text = entry.read().trim();
+    } catch {
+      continue;
+    }
+    if (text === "") continue;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new Error(`${entry.label} is not valid JSON.`);
+    }
+    if (parsed === null || typeof parsed !== "object") {
+      throw new Error(`${entry.label} must be a JSON object.`);
+    }
+
+    const raw = parsed as Record<string, unknown>;
+    const token = bareToken(raw["authorization"] ?? raw["token"]);
+    const cookie = cookieHeader(raw["cookies"] ?? raw["cookie"]);
+    if (token === "" || cookie === "") {
+      throw new Error(
+        `${entry.label} needs both credentials.\n\n` +
+          "Copy the two request headers of any chat.deepseek.com API call\n" +
+          "(DevTools -> Network -> create_pow_challenge is a good one):\n\n" +
+          '  {"authorization": "Bearer <token>", "cookie": "ds_session_id=<...>; ..."}\n',
+      );
+    }
+    const source =
+      entry.label === SESSION_FILE ? path.resolve(process.cwd(), SESSION_FILE) : entry.label;
+    return { token, cookie, source };
+  }
+
+  return null;
+}
+
+/**
+ * The useful line out of a Chromium launch failure. Playwright's message starts
+ * with the same "has been closed" line for every cause, which tells nobody
+ * anything - the reason is further down, in the browser's own log.
+ */
+function launchReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const lines = message
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  return (
+    lines.find((line) =>
+      /shared librar|cannot open|Executable doesn't exist|permission denied|no such file/i.test(line),
+    ) ?? lines[0] ??
+    message
+  );
+}
+
+/** Request-header cookies, ready for the browser. */
+function cookiePairs(header: string): Array<{ name: string; value: string }> {
+  return header
+    .split(";")
+    .map((part) => part.trim())
+    .filter((part) => part.includes("="))
+    .map((part) => {
+      const eq = part.indexOf("=");
+      return { name: part.slice(0, eq).trim(), value: part.slice(eq + 1) };
+    })
+    .filter((cookie) => cookie.name !== "");
+}
+
 const sleep = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
 
 /** Race work against a deadline without leaving a timer hanging. */
@@ -93,6 +233,10 @@ export class Browser {
   private lastSeenId = 0;
   /** What DeepSeek posted lately, for the "the turn never went out" error. */
   private readonly posted: string[] = [];
+  /** Where the sign-in came from, for the banner. */
+  login = "browser profile";
+  /** How the browser runs, for the banner. */
+  mode = "Chromium";
 
   private constructor(
     private readonly context: BrowserContext,
@@ -106,11 +250,12 @@ export class Browser {
     });
   }
 
-  /** Open the window, load the site, and wait until the profile is signed in. */
+  /** Start the browser, sign in, and load the site. */
   static async open(log: (text: string) => void = () => {}): Promise<Browser> {
     const dir = profileDir();
     fs.mkdirSync(dir, { recursive: true });
-    const headless = boolEnv("ANYAGENT_HEADLESS", false);
+    const credentials = loadCredentials();
+    const headless = boolEnv("ANYAGENT_HEADLESS", true);
     const executable = (process.env["ANYAGENT_BROWSER_PATH"] ?? "").trim();
 
     let context: BrowserContext;
@@ -124,21 +269,51 @@ export class Browser {
         args: ["--disable-blink-features=AutomationControlled"],
       });
     } catch (error) {
-      const reason = error instanceof Error ? error.message.split("\n")[0] : String(error);
       throw new Error(
-        `Could not start Chromium: ${reason}\n\n` +
+        `Could not start Chromium: ${launchReason(error)}\n\n` +
           "Install the browser once with:  npx playwright install chromium\n" +
-          "If another window is already using the profile, close it and try again.\n" +
+          "If another copy is using the profile, close it and try again.\n" +
           `Profile: ${dir}`,
       );
     }
 
     const page = context.pages()[0] ?? (await context.newPage());
     const browser = new Browser(context, page);
+    browser.mode = headless ? "Chromium, hidden" : "Chromium, window";
+    browser.login = credentials === null ? `browser profile (${dir})` : credentials.source;
+    if (credentials !== null) await browser.seed(credentials);
     await browser.installModes();
     await page.goto(`${HOST}/`, { waitUntil: "domcontentloaded", timeout: 60_000 });
-    await browser.ensureSignedIn(log);
+    await browser.ensureSignedIn(log, credentials);
     return browser;
+  }
+
+  /**
+   * Put the captured session into the browser before the site's own scripts
+   * run: the cookies as browser cookies, and the token where the site keeps
+   * its own. Nothing is typed and no window is needed.
+   */
+  private async seed(credentials: Credentials): Promise<void> {
+    const cookies = cookiePairs(credentials.cookie).map((cookie) => ({
+      name: cookie.name,
+      value: cookie.value,
+      url: HOST,
+      secure: true,
+    }));
+    if (cookies.length > 0) {
+      try {
+        await this.context.addCookies(cookies);
+      } catch {
+        // One odd value must not cost us the rest of the session.
+        for (const cookie of cookies) await this.context.addCookies([cookie]).catch(() => {});
+      }
+    }
+
+    await this.context.addInitScript((token: string) => {
+      const store = (globalThis as unknown as { localStorage: { setItem(k: string, v: string): void } })
+        .localStorage;
+      store.setItem("userToken", JSON.stringify({ value: token, __version: "0" }));
+    }, credentials.token);
   }
 
   /**
@@ -167,13 +342,23 @@ export class Browser {
     });
   }
 
-  private async ensureSignedIn(log: (text: string) => void): Promise<void> {
+  private async ensureSignedIn(log: (text: string) => void, credentials: Credentials | null): Promise<void> {
     if (await this.signedIn(15_000)) return;
-    if (boolEnv("ANYAGENT_HEADLESS", false)) {
+
+    if (credentials !== null) {
       throw new Error(
-        "This browser profile is not signed in, and the window is headless.\n" +
-          "Run once without ANYAGENT_HEADLESS to sign in, or point ANYAGENT_PROFILE_DIR " +
-          "at a profile that is already signed in.",
+        `chat.deepseek.com rejected the captured session in ${credentials.source}.\n` +
+          "Re-capture the authorization and cookie headers from the site.\n" +
+          "The aws-waf-token cookie inside `cookie` is usually the one that expires first.",
+      );
+    }
+
+    if (boolEnv("ANYAGENT_HEADLESS", true)) {
+      throw new Error(
+        "Not signed in, and the browser window is hidden.\n\n" +
+          "Either put your DeepSeek session next to the project as DEEPSEEK_SESSION_JSON:\n" +
+          '  {"authorization": "Bearer <token>", "cookie": "ds_session_id=<...>; ..."}\n\n' +
+          "or run once with ANYAGENT_HEADLESS=0 to sign in in the window - the profile keeps it.",
       );
     }
     log("Not signed in. Sign in at chat.deepseek.com in the browser window - anyagent carries on by itself.");
@@ -199,11 +384,11 @@ export class Browser {
     return this.page.locator("#chat-input, textarea, [contenteditable='true']").filter({ visible: true }).last();
   }
 
-  /** One turn: type the prompt, send it, and read DeepSeek's own response. */
+  /** One turn: paste the prompt, send it, and read DeepSeek's own response. */
   async ask(prompt: string): Promise<Completion> {
     // The response has to be watched for before it is sent, or it is missed.
     const pending = this.waitForCompletion(20_000);
-    await this.type(prompt);
+    await this.submit(prompt);
     let started = await pending;
     if (started === null) {
       await this.clickSend();
@@ -242,7 +427,8 @@ export class Browser {
       .catch(() => null);
   }
 
-  private async type(prompt: string): Promise<void> {
+  /** The prompt goes in in one go, the way a paste does - no key-by-key typing. */
+  private async submit(prompt: string): Promise<void> {
     if (PACE_MS > 0) await sleep(PACE_MS / 2 + Math.random() * PACE_MS);
     const composer = this.composer();
     await composer.click({ timeout: 15_000 });

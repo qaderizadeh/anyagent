@@ -8,8 +8,10 @@
  *   anyagent --session ID     continue a specific session
  *   anyagent --cwd DIR        working directory for the commands
  *
- * Everything runs through a real Chromium window with a persistent profile.
- * Sign in there once; the profile keeps it. Sessions and messages live on
+ * Everything runs through a real Chromium, hidden by default. The sign-in is
+ * the captured authorization + cookie from DEEPSEEK_SESSION_JSON, put into the
+ * browser before the page loads; with no such file the browser profile is used
+ * and you sign in once in a visible window. Sessions and messages live on
  * chat.deepseek.com - nothing is stored locally.
  */
 
@@ -18,7 +20,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { Agent, shellName } from "./agent.js";
-import { Browser, modes, profileDir, type ChatSession } from "./browser.js";
+import { Browser, modes, type ChatSession } from "./browser.js";
 
 const dim = (text: string): string => (process.stdout.isTTY ? `\x1b[2m${text}\x1b[0m` : text);
 const bold = (text: string): string => (process.stdout.isTTY ? `\x1b[1m${text}\x1b[0m` : text);
@@ -37,10 +39,11 @@ Usage:
   anyagent --cwd DIR        working directory
 
 Env:
-  ANYAGENT_PROFILE_DIR       browser profile that holds the login (default ~/.anyagent/browser)
-  ANYAGENT_HEADLESS          "1" to hide the browser window (default: visible)
+  DEEPSEEK_SESSION_JSON      captured authorization + cookie (or DEEPSEEK_SESSION_PATH)
+  ANYAGENT_PROFILE_DIR       browser profile, used when there is no credentials file
+  ANYAGENT_HEADLESS          "0" to show the browser window (default: hidden)
   ANYAGENT_BROWSER_PATH      use this Chromium/Chrome instead of the bundled one
-  ANYAGENT_PACE_MS           pause before each prompt (default: 800)
+  ANYAGENT_PACE_MS           pause before each prompt (default: 300)
   DEEPSEEK_THINKING_ENABLED  deep thinking (default: on)
   DEEPSEEK_SEARCH_ENABLED    web search (default: off)
   DEEPSEEK_MAX_ITERATIONS    loop limit (default: 50)
@@ -184,8 +187,8 @@ async function run(args: Args, browser: Browser, cwd: string): Promise<void> {
   const { thinking, search } = modes();
   console.log(bold("AnyAgent"));
   console.log("────────────────────────────");
-  console.log(`${dim("Backend:  ")} chat.deepseek.com (Chromium)`);
-  console.log(`${dim("Profile:  ")} ${profileDir()}`);
+  console.log(`${dim("Backend:  ")} chat.deepseek.com (${browser.mode})`);
+  console.log(`${dim("Login:    ")} ${browser.login}`);
   console.log(`${dim("Session:  ")} ${agent.id || "(new chat)"}`);
   console.log(`${dim("Thinking: ")} ${thinking ? "enabled" : "disabled"}`);
   console.log(`${dim("Search:   ")} ${search ? "enabled" : "disabled"}`);
