@@ -1,26 +1,34 @@
 /**
- * The agent: a loop, one command, one answer shape.
+ * The agent: a chat with someone who runs the commands you give them.
  *
- *   task -> model -> {"text": "...", "command": "..."} -> run one command -> ...
+ *   task -> reply -> a ```bash block -> run it -> paste what it printed -> ...
  *
- * The agent owns the conversation, because Ollama has no memory of its own:
- * every request carries the messages. Everything else is the model's job.
+ * Nothing here tells the model it is an agent holding a tool. It is having an
+ * ordinary conversation with a person who works in a terminal and pastes the
+ * output back - which is exactly what a person does on chat.deepseek.com. All
+ * this file adds is running the block and typing the result back.
+ *
+ * A reply with no shell block ends the task: either it is finished, or it is
+ * blocked and asking for something only a person can do.
+ *
+ * No conversation state lives here. The chat is the one open in the browser,
+ * and everything in it stays on chat.deepseek.com.
  */
 
 import { exec } from "node:child_process";
 import { existsSync } from "node:fs";
 import * as path from "node:path";
+import type { Browser } from "./browser.js";
 
-import type { Message, Ollama } from "./ollama.js";
-
-const MAX_STEPS = intEnv("ANYAGENT_MAX_ITERATIONS", 50);
-const SHELL_TIMEOUT_MS = intEnv("ANYAGENT_SHELL_TIMEOUT_MS", 120_000);
-/** How many past messages travel with each request. Local models have small contexts. */
-const CONTEXT_MESSAGES = intEnv("ANYAGENT_CONTEXT_MESSAGES", 24);
-/** A command's output is clipped: a local model cannot read 30k of it anyway. */
-const MAX_OUTPUT_CHARS = 8_000;
-/** Extra attempts allowed for a reply we cannot use. */
+const MAX_STEPS = intEnv("DEEPSEEK_MAX_ITERATIONS", 50);
+const SHELL_TIMEOUT_MS = intEnv("DEEPSEEK_SHELL_TIMEOUT_MS", 120_000);
+const MAX_OUTPUT_CHARS = 30_000;
+/** Extra attempts allowed when the backend sends nothing back at all. */
 const MAX_RETRIES = 2;
+/** Wait before asking again when nothing came back (it may be a hiccup). */
+const RETRY_DELAY_MS = 2_000;
+
+const sleep = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
 
 function intEnv(name: string, fallback: number): number {
   const value = Number(process.env[name]);
@@ -55,31 +63,19 @@ export function shellName(): string {
 }
 
 /**
- * The one answer shape, as a system message.
- *
- * Ollama also enforces this as a JSON schema, so the shape is guaranteed; this
- * prompt is what tells the model what the *words* mean.
+ * The one thing a person has to say before the chat makes sense: what machine
+ * they are on, where they are, and how they will answer. Sent once, as the
+ * first message of a new chat - a person does not re-introduce themselves.
  */
-export function header(cwd: string): string {
+export function setup(cwd: string): string {
   const shell = shellName();
   return [
-    `You are a command-line agent on the user's ${OS_NAME} computer. Commands run in ${shell},`,
-    `one at a time, starting in ${cwd}.`,
-    "You act only by running commands: that is how you inspect this machine and how you change it.",
-    "When a task needs something this machine knows - the time, the files, the OS, what is",
-    "installed - run a command to find it. Never answer that from memory, and never reply that",
-    "you cannot access the machine: you can, by running a command.",
-    "Always reply with one JSON object in exactly this shape and nothing else -",
-    "no prose, no markdown, no code fence:",
-    `{"text": "short note for the user", "command": "the ${shell} command to run"}`,
-    'Put "" in "command" only when the task is finished, or when you are truly stuck and need',
-    'the user to do something - explain that in "text".',
-    "Never claim something worked unless a command result showed it.",
+    `I'm at a ${shell} prompt on my ${OS_NAME} machine, in ${cwd}, and I'll paste back whatever prints.`,
+    `Give me one command at a time in a \`\`\`${shell} block. Each one runs in a fresh ${shell} in that`,
+    "directory, so chain steps with && when they have to happen together.",
+    "Say briefly what each one is for. No block means you are done, or you need me.",
   ].join("\n");
 }
-
-const NUDGE =
-  'Reply with one JSON object only, nothing else: {"text": "...", "command": "..."} - an empty command means you are done.';
 
 export type ShellResult = {
   exitCode: number;
@@ -88,12 +84,109 @@ export type ShellResult = {
 };
 
 /* ------------------------------------------------------------------ */
-/* tool                                                                */
+/* the command                                                         */
+/* ------------------------------------------------------------------ */
+
+const FENCE = /^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+#.-]*)\s*$/;
+
+type Block = { info: string; body: string; raw: string };
+
+/** Fence tags worth running. Anything else is text the model is showing us. */
+function isShell(info: string): boolean {
+  return info === "" || /^(sh|bash|zsh|shell|dash|ksh|console|posix|sh-script|bash-script)$/.test(info);
+}
+
+/** A block copied out of a terminal still has its prompt on it: drop the "$ ". */
+function stripPrompt(body: string): string {
+  const lines = body.split("\n");
+  const first = lines.find((line) => line.trim() !== "");
+  if (first === undefined || !/^\s*\$\s+\S/.test(first)) return body;
+  return lines.map((line) => line.replace(/^\s*\$\s+/, "")).join("\n");
+}
+
+/** Tidy the prose: no runs of blank lines where a command used to be. */
+function tidy(text: string): string {
+  return text.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/**
+ * Split a reply into its fenced blocks and the text around them. Any block
+ * that is not a command is left in the text - the model may be showing us
+ * something, and that is worth seeing.
+ */
+function split(reply: string): { blocks: Block[]; text: string } {
+  const lines = reply.split("\n");
+  const blocks: Block[] = [];
+  const kept: string[] = [];
+  let open: string | null = null;
+  let info = "";
+  let body: string[] = [];
+  let start = 0;
+
+  const close = (end: number): void => {
+    const block: Block = { info, body: body.join("\n"), raw: lines.slice(start, end + 1).join("\n") };
+    blocks.push(block);
+    if (!isShell(block.info)) kept.push(block.raw);
+    open = null;
+  };
+
+  lines.forEach((line, index) => {
+    const match = FENCE.exec(line);
+    if (open === null) {
+      if (match === null) {
+        kept.push(line);
+        return;
+      }
+      open = match[1]!;
+      info = match[2]!.toLowerCase();
+      body = [];
+      start = index;
+      return;
+    }
+    // A closer is a bare fence of the same kind; anything else is content.
+    if (match !== null && match[1]![0] === open[0] && match[2] === "") {
+      close(index);
+      return;
+    }
+    body.push(line);
+  });
+  // A fence the model forgot to close is still a block.
+  if (open !== null) close(lines.length - 1);
+
+  return { blocks, text: tidy(kept.join("\n")) };
+}
+
+/** The one command to run this turn, or "" when the task is over. */
+export function commandIn(reply: string): string {
+  const block = split(reply).blocks.find((item) => isShell(item.info));
+  return block === undefined ? "" : stripPrompt(block.body).trim();
+}
+
+/** What the model said while still working, with the commands taken out. */
+export function proseOf(reply: string): string {
+  return split(reply).text;
+}
+
+/* ------------------------------------------------------------------ */
+/* what the person types back                                          */
 /* ------------------------------------------------------------------ */
 
 function clip(text: string): string {
   if (text.length <= MAX_OUTPUT_CHARS) return text;
   return `${text.slice(0, MAX_OUTPUT_CHARS)}\n... [truncated ${text.length - MAX_OUTPUT_CHARS} chars]`;
+}
+
+/**
+ * The terminal output, as a person would paste it. Output only - they can see
+ * which command it belongs to. A failure says so, because a person would.
+ */
+export function paste(result: ShellResult): string {
+  const body = [result.stdout.trim(), result.stderr.trim()]
+    .filter((part) => part !== "")
+    .join("\n");
+
+  if (result.exitCode === 0) return body === "" ? "(no output)" : body;
+  return body === "" ? `(exit code ${result.exitCode})` : `${body}\n(exit code ${result.exitCode})`;
 }
 
 /** Run one shell command and always resolve with its exit code and output. */
@@ -114,7 +207,7 @@ export function runShell(command: string, cwd: string): Promise<ShellResult> {
         // A shell that never started reports itself only in the error, so keep
         // that too - otherwise the failure is just "exit 1" with no reason.
         const missing = failure != null && typeof failure.code === "string" ? failure.message : "";
-        const killed = failure?.killed ? `[killed after ${SHELL_TIMEOUT_MS}ms]` : "";
+        const killed = failure?.killed ? `[stopped after ${SHELL_TIMEOUT_MS}ms]` : "";
         resolve({
           exitCode,
           stdout: clip(String(stdout)),
@@ -126,107 +219,76 @@ export function runShell(command: string, cwd: string): Promise<ShellResult> {
 }
 
 /* ------------------------------------------------------------------ */
-/* reply parsing                                                       */
-/* ------------------------------------------------------------------ */
-
-export type Reply = {
-  /** What to tell the user. */
-  text: string;
-  /** Empty means: done, blocked, or waiting for the user. */
-  command: string;
-};
-
-function asObject(text: string): Record<string, unknown> | null {
-  try {
-    const value: unknown = JSON.parse(text);
-    return value !== null && typeof value === "object" && !Array.isArray(value)
-      ? (value as Record<string, unknown>)
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Read {"text","command"} out of a reply. Returns null if there is none. */
-export function parseReply(reply: string): Reply | null {
-  // The schema makes this valid JSON already; older Ollama builds and some
-  // models still wrap it in a fence or a sentence, so look inside too.
-  const body = reply.replace(/```[a-z]*\s*/gi, "").trim();
-  const start = body.indexOf("{");
-  const end = body.lastIndexOf("}");
-  const wrapped = start >= 0 && end > start ? body.slice(start, end + 1) : body;
-  const object = asObject(body) ?? asObject(wrapped);
-  if (object === null) return null;
-
-  const field = (value: unknown): string => (typeof value === "string" ? value.trim() : "");
-  return { text: field(object["text"]), command: field(object["command"]) };
-}
-
-/* ------------------------------------------------------------------ */
-/* agent                                                               */
+/* agent                                                              */
 /* ------------------------------------------------------------------ */
 
 export type AgentEvents = {
-  /** What the model says about the step it is taking. */
-  onText?: (text: string) => void;
-  onTool?: (command: string) => void;
-  onToolResult?: (result: ShellResult) => void;
+  /** What the model said this turn, with the command taken out. */
+  onReply?: (prose: string) => void;
+  /** The command we are about to run. */
+  onCommand?: (command: string) => void;
+  onResult?: (result: ShellResult) => void;
 };
 
 export class Agent {
+  /** The setup blurb is said at the start of a chat, and only then. */
+  private introduced = false;
+
   constructor(
-    private readonly ollama: Ollama,
+    private readonly browser: Browser,
     private readonly cwd: string,
-    /** The conversation, without the system message. Kept by reference. */
-    private readonly messages: Message[],
   ) {}
 
-  get history(): Message[] {
-    return this.messages;
+  get id(): string {
+    return this.browser.currentChatId();
   }
 
-  /** What Ollama is asked this turn: the prompt, then the recent conversation. */
-  private request(): Message[] {
-    return [
-      { role: "system", content: header(this.cwd) },
-      ...this.messages.slice(-CONTEXT_MESSAGES),
-    ];
+  /** Continue an existing chat. It already has its setup in the history. */
+  async openSession(chatId: string): Promise<void> {
+    await this.browser.openSession(chatId);
+    this.introduced = true;
+  }
+
+  /** Start a new chat, which needs the setup again. */
+  async newSession(): Promise<void> {
+    await this.browser.newSession();
+    this.introduced = false;
   }
 
   async run(task: string, events: AgentEvents = {}): Promise<string> {
-    this.messages.push({ role: "user", content: task });
-    let unusable = 0;
+    let prompt = this.introduced ? task : `${setup(this.cwd)}\n\n${task}`;
+    this.introduced = true;
+    let quiet = 0; // nothing came back from the model
 
     for (let step = 0; step < MAX_STEPS; step++) {
-      const raw = (await this.ollama.chat(this.request())).trim();
-      const parsed = parseReply(raw);
+      const raw = (await this.browser.ask(prompt)).text.trim();
 
-      if (parsed === null || (parsed.text === "" && parsed.command === "")) {
-        unusable += 1;
-        if (unusable > MAX_RETRIES) {
+      // An empty reply is the backend or the connection, not the model - its
+      // answer, if there was one, was already looked up on chat.deepseek.com.
+      if (raw === "") {
+        quiet += 1;
+        if (quiet > MAX_RETRIES) {
           throw new Error(
-            parsed === null
-              ? "The model never answered with one {\"text\",\"command\"} object, so the task stopped here.\n" +
-                  `Its last reply was:\n${raw === "" ? "(nothing at all)" : raw.slice(0, 400)}`
-              : "The model answered with an empty reply three times in a row, so the task stopped here.\n" +
-                  "The conversation is saved - try again, or /new with a smaller model.",
+            `Nothing came back from DeepSeek ${quiet} times in a row, so the task stopped here.\n` +
+              "No reply arrived and none was stored on the backend, so there is nothing to recover.\n" +
+              "Your chat is intact on chat.deepseek.com - send the task again, or use /new.",
           );
         }
-        this.messages.push({ role: "user", content: NUDGE });
+        await sleep(RETRY_DELAY_MS * quiet);
         continue;
       }
+      quiet = 0;
 
-      unusable = 0;
-      this.messages.push({ role: "assistant", content: raw });
+      // No command means the task is over - finished, or blocked and asking
+      // for something only a person can do. The whole reply is the answer.
+      const command = commandIn(raw);
+      if (command === "") return raw;
 
-      // An empty command is the agent's way of saying it is done or blocked.
-      if (parsed.command === "") return parsed.text;
-
-      events.onText?.(parsed.text);
-      events.onTool?.(parsed.command);
-      const result = await runShell(parsed.command, this.cwd);
-      events.onToolResult?.(result);
-      this.messages.push({ role: "user", content: `Result:\n${JSON.stringify(result)}` });
+      events.onReply?.(proseOf(raw));
+      events.onCommand?.(command);
+      const result = await runShell(command, this.cwd);
+      events.onResult?.(result);
+      prompt = paste(result);
     }
 
     return "Agent stopped: maximum iterations reached.";

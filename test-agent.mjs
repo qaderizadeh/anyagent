@@ -1,0 +1,380 @@
+/**
+ * Tests for the human-simulation protocol.
+ *
+ * The heart of this version is: a normal chat reply, a fenced command inside
+ * it, and the terminal output pasted back. None of that needs a browser, so
+ * the loop runs against a stub chat that records every prompt it is sent.
+ */
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
+// Read when the module loads, so set them before importing it.
+process.env.DEEPSEEK_MAX_ITERATIONS = "6";
+process.env.DEEPSEEK_SHELL_TIMEOUT_MS = "1500";
+
+const { Agent, commandIn, proseOf, paste, setup, shellName } = await import("./dist/agent.js");
+
+let passed = 0;
+const failures = [];
+
+function test(name, fn) {
+  try {
+    fn();
+    passed += 1;
+    console.log(`  ok   ${name}`);
+  } catch (error) {
+    failures.push({ name, error });
+    console.log(`  FAIL ${name}\n       ${error.message.split("\n")[0]}`);
+  }
+}
+
+async function testAsync(name, fn) {
+  try {
+    await fn();
+    passed += 1;
+    console.log(`  ok   ${name}`);
+  } catch (error) {
+    failures.push({ name, error });
+    console.log(`  FAIL ${name}\n       ${error.message.split("\n")[0]}`);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+console.log("\n== the setup blurb ==\n");
+/* ------------------------------------------------------------------ */
+
+test("names the machine, the shell, the directory and the fence", () => {
+  const text = setup("/home/me/project");
+  assert.match(text, /Linux|macOS|Windows/);
+  assert.match(text, new RegExp(shellName()));
+  assert.match(text, /\/home\/me\/project/);
+  assert.match(text, new RegExp("```" + shellName()));
+});
+
+test("says that no block means the end", () => {
+  assert.match(setup("/tmp"), /No block means you are done/);
+});
+
+test("is short", () => {
+  const lines = setup("/home/me/project").split("\n");
+  assert.ok(lines.length <= 5, `expected <= 5 lines, got ${lines.length}`);
+});
+
+/* ------------------------------------------------------------------ */
+console.log("\n== pulling the command out of a reply ==\n");
+/* ------------------------------------------------------------------ */
+
+test("takes the command out of a bash block", () => {
+  const reply = "Let me check.\n\n```bash\nls -la\n```\n";
+  assert.equal(commandIn(reply), "ls -la");
+});
+
+test("accepts a bare fence", () => {
+  assert.equal(commandIn("```\nwhoami\n```"), "whoami");
+});
+
+test("accepts sh, zsh and shell tags", () => {
+  for (const tag of ["sh", "zsh", "shell", "bash"]) {
+    assert.equal(commandIn(`\`\`\`${tag}\ndate\n\`\`\``), "date", tag);
+  }
+});
+
+test("accepts a tilde fence", () => {
+  assert.equal(commandIn("~~~bash\ndate\n~~~"), "date");
+});
+
+test("keeps a multi-line block together", () => {
+  const reply = "```bash\ncd /tmp && pwd\nls\n```";
+  assert.equal(commandIn(reply), "cd /tmp && pwd\nls");
+});
+
+test("still uses a fence the model forgot to close", () => {
+  assert.equal(commandIn("Sure:\n\n```bash\nuname -a\n"), "uname -a");
+});
+
+test("shrinks to nothing when there is no block", () => {
+  assert.equal(commandIn("The task is complete."), "");
+});
+
+test("ignores a block that is not a shell command", () => {
+  assert.equal(commandIn("Here is the JSON:\n\n```json\n{\"a\": 1}\n```"), "");
+  assert.equal(commandIn("```python\nprint(1)\n```"), "");
+  assert.equal(commandIn("```text\nsome output\n```"), "");
+});
+
+test("drops a terminal prompt copied into the block", () => {
+  assert.equal(commandIn("```bash\n$ ls -la\n```"), "ls -la");
+  assert.equal(commandIn("```bash\n$ cd /tmp\n$ pwd\n```"), "cd /tmp\npwd");
+});
+
+test("leaves a block alone when it only looks prompt-like", () => {
+  // A path or a shell variable starting with $ is a command, not a prompt.
+  assert.equal(commandIn("```bash\n$HOME/bin/run\n```"), "$HOME/bin/run");
+});
+
+test("runs one block at a time, not all of them", () => {
+  const reply = "First:\n\n```bash\necho one\n```\n\nOr maybe:\n\n```bash\necho two\n```";
+  assert.equal(commandIn(reply), "echo one");
+});
+
+test("prefers a shell block over a non-shell one", () => {
+  const reply = "```json\n{\"n\": 1}\n```\n\n```bash\necho hi\n```";
+  assert.equal(commandIn(reply), "echo hi");
+});
+
+test("does not treat an inline code span as a block", () => {
+  assert.equal(commandIn("Use ```bash``` for that."), "");
+});
+
+/* ------------------------------------------------------------------ */
+console.log("\n== what the model is told, with the command taken out ==\n");
+/* ------------------------------------------------------------------ */
+
+test("drops the block from the prose", () => {
+  const reply = "Let me check the date.\n\n```bash\ndate\n```";
+  assert.equal(proseOf(reply), "Let me check the date.");
+});
+
+test("keeps prose on both sides of the block", () => {
+  const reply = "First this.\n\n```bash\ndate\n```\n\nThen we know.";
+  assert.equal(proseOf(reply), "First this.\n\nThen we know.");
+});
+
+test("keeps the model's own output blocks in the prose", () => {
+  const reply = "It should print:\n\n```text\nhello\n```";
+  assert.match(proseOf(reply), /hello/);
+});
+
+/* ------------------------------------------------------------------ */
+console.log("\n== what gets typed back ==\n");
+/* ------------------------------------------------------------------ */
+
+test("is the output, and nothing else", () => {
+  assert.equal(paste({ exitCode: 0, stdout: "total 8\n", stderr: "" }), "total 8");
+});
+
+test("says so when there was nothing to show", () => {
+  assert.equal(paste({ exitCode: 0, stdout: "", stderr: "" }), "(no output)");
+});
+
+test("keeps stderr", () => {
+  assert.equal(paste({ exitCode: 1, stdout: "", stderr: "ls: cannot access 'x'" }), "ls: cannot access 'x'\n(exit code 1)");
+});
+
+test("reports a non-zero exit code", () => {
+  assert.equal(paste({ exitCode: 2, stdout: "some output", stderr: "" }), "some output\n(exit code 2)");
+});
+
+test("says nothing about a successful exit", () => {
+  assert.doesNotMatch(paste({ exitCode: 0, stdout: "fine", stderr: "" }), /exit/);
+});
+
+test("puts stdout before stderr", () => {
+  assert.equal(paste({ exitCode: 3, stdout: "out", stderr: "err" }), "out\nerr\n(exit code 3)");
+});
+
+test("does not echo the command back", () => {
+  const typed = paste({ exitCode: 0, stdout: "/usr/bin", stderr: "" });
+  assert.doesNotMatch(typed, /pwd/);
+});
+
+/* ------------------------------------------------------------------ */
+console.log("\n== the loop ==\n");
+/* ------------------------------------------------------------------ */
+
+/** A stand-in for the browser: hands back scripted replies, records prompts. */
+function fakeChat(replies) {
+  const sent = [];
+  let index = 0;
+  const chat = {
+    login: "stub",
+    mode: "stub",
+    sent,
+    async ask(prompt) {
+      sent.push(prompt);
+      const reply = replies[index++];
+      if (reply === undefined) throw new Error(`stub ran out of replies after ${sent.length} turns`);
+      return { text: typeof reply === "function" ? await reply(prompt) : reply };
+    },
+    currentChatId: () => "chat-1",
+    async newSession() {},
+    async openSession() {},
+    async close() {},
+    async listSessions() {
+      return [];
+    },
+  };
+  return chat;
+}
+
+const CWD = fs.mkdtempSync(path.join(os.tmpdir(), "anyagent-test-"));
+
+// A command that never finishes must be reported, not hung on.
+await testAsync("stops a command that never finishes", async () => {
+  const chat = fakeChat(["```bash\nsleep 30\n```", "It was stopped."]);
+  await new Agent(chat, CWD).run("wait forever");
+  assert.match(chat.sent[1], /stopped after/);
+});
+
+await testAsync("runs the command, pastes the output, and stops on a reply with no block", async () => {
+  const chat = fakeChat([
+    "The date is what we want.\n\n```bash\necho hello-from-the-shell\n```",
+    "It printed hello-from-the-shell. Done.",
+  ]);
+  const agent = new Agent(chat, CWD);
+  const answer = await agent.run("say hello");
+
+  assert.equal(answer, "It printed hello-from-the-shell. Done.");
+  assert.equal(chat.sent.length, 2);
+  assert.equal(chat.sent[1], "hello-from-the-shell");
+});
+
+await testAsync("says the setup once, as part of the first message", async () => {
+  const chat = fakeChat(["All done.", "Second reply."]);
+  const agent = new Agent(chat, CWD);
+  await agent.run("first task");
+  await agent.run("second task");
+
+  assert.match(chat.sent[0], /first task/);
+  assert.match(chat.sent[0], new RegExp(CWD));
+  assert.equal(chat.sent[1], "second task", "later tasks in the same chat stand on their own");
+});
+
+await testAsync("does not repeat the setup when a chat is resumed", async () => {
+  const chat = fakeChat(["Continuing."]);
+  const agent = new Agent(chat, CWD);
+  await agent.openSession("chat-1");
+  await agent.run("what were we doing?");
+
+  assert.equal(chat.sent[0], "what were we doing?");
+});
+
+await testAsync("says the setup again after /new", async () => {
+  const chat = fakeChat(["One.", "Two."]);
+  const agent = new Agent(chat, CWD);
+  await agent.run("first");
+  await agent.newSession();
+  await agent.run("second");
+
+  assert.match(chat.sent[1], /second/);
+  assert.match(chat.sent[1], new RegExp(CWD), "a new chat needs the setup again");
+});
+
+await testAsync("sends the failure back so the model can react to it", async () => {
+  const chat = fakeChat([
+    "```bash\nexit 7\n```",
+    "That failed, let me look elsewhere.",
+  ]);
+  const agent = new Agent(chat, CWD);
+  await agent.run("break something");
+
+  assert.equal(chat.sent[1], "(exit code 7)");
+});
+
+await testAsync("sends stderr back too", async () => {
+  const chat = fakeChat(["```bash\nls /definitely-not-here\n```", "Not found."]);
+  await new Agent(chat, CWD).run("look for it");
+  assert.match(chat.sent[1], /No such file or directory/);
+});
+
+await testAsync("keeps a multi-line block in one shell, so cd sticks", async () => {
+  const chat = fakeChat(["```bash\ncd /tmp\npwd\n```", "You are in /tmp."]);
+  await new Agent(chat, CWD).run("where am I");
+  assert.equal(chat.sent[1], "/tmp");
+});
+
+await testAsync("runs the command in the working directory", async () => {
+  const chat = fakeChat(["```bash\npwd\n```", "Done."]);
+  await new Agent(chat, CWD).run("where am I");
+  assert.equal(chat.sent[1], CWD);
+});
+
+await testAsync("starts each block in a fresh shell", async () => {
+  const chat = fakeChat(["```bash\ncd /tmp\n```", "```bash\npwd\n```", "Done."]);
+  await new Agent(chat, CWD).run("go to /tmp");
+  assert.equal(chat.sent[2], CWD, "a later block does not inherit an earlier cd");
+});
+
+await testAsync("catches a shell that never started", async () => {
+  const chat = fakeChat(["```bash\nthis-command-does-not-exist-xyz --go\n```", "Right."]);
+  await new Agent(chat, CWD).run("run it");
+  assert.match(chat.sent[1], /command not found/);
+});
+
+await testAsync("reads a file for the model", async () => {
+  const chat = fakeChat(["```bash\ncat /etc/hostname\n```", "Noted."]);
+  await new Agent(chat, CWD).run("read the hostname");
+  assert.ok(chat.sent[1].trim().length > 0);
+  assert.doesNotMatch(chat.sent[1], /exit code/);
+});
+
+await testAsync("cannot loop forever", async () => {
+  // A model that only ever sends commands never reaches a reply with no block.
+  const long = fakeChat(new Array(20).fill("```bash\necho again\n```"));
+  const answer = await new Agent(long, CWD).run("never finish");
+  assert.equal(answer, "Agent stopped: maximum iterations reached.");
+  assert.equal(long.sent.length, 6, "stops at DEEPSEEK_MAX_ITERATIONS, not before and not after");
+});
+
+await testAsync("asks again when the backend sends nothing back", async () => {
+  const chat = fakeChat(["", "", "Here at last."]);
+  const answer = await new Agent(chat, CWD).run("say something");
+  assert.equal(answer, "Here at last.");
+  assert.equal(chat.sent.length, 3);
+});
+
+await testAsync("gives up honestly when nothing ever comes back", async () => {
+  const chat = fakeChat(["", "", "", ""]);
+  await assert.rejects(
+    () => new Agent(chat, CWD).run("say something"),
+    /Nothing came back from DeepSeek 3 times in a row/,
+  );
+});
+
+await testAsync("treats a reply with no shell block as the answer, and keeps it whole", async () => {
+  const reply = 'Here it is:\n\n```json\n{"a": 1}\n```';
+  const chat = fakeChat([reply]);
+  const answer = await new Agent(chat, CWD).run("do something");
+  assert.equal(answer, reply);
+  assert.equal(chat.sent.length, 1, "nothing was run, so nothing is sent back");
+});
+
+await testAsync("does not run a block the model is only showing us", async () => {
+  const chat = fakeChat(["The output will look like:\n\n```text\nhello world\n```", "Anything else?"]);
+  const answer = await new Agent(chat, CWD).run("what will it print");
+  assert.match(answer, /hello world/);
+  assert.match(chat.sent[0], /what will it print/);
+  assert.equal(chat.sent.length, 1);
+});
+
+await testAsync("says when a big output was cut short", async () => {
+  const chat = fakeChat(["```bash\nhead -c 60000 /dev/zero | tr '\\0' 'x'\n```", "That is a lot."]);
+  await new Agent(chat, CWD).run("print a lot");
+  assert.match(chat.sent[1], /\.\.\. \[truncated \d+ chars\]/);
+  assert.ok(chat.sent[1].length < 40_000, "the paste must stay bounded");
+});
+
+await testAsync("reports the events as they happen", async () => {
+  const chat = fakeChat(["Let me look.\n\n```bash\necho observed\n```", "Done."]);
+  const seen = { replies: [], commands: [], results: [] };
+  await new Agent(chat, CWD).run("observe", {
+    onReply: (prose) => seen.replies.push(prose),
+    onCommand: (command) => seen.commands.push(command),
+    onResult: (result) => seen.results.push(result),
+  });
+
+  // Only the working turns are announced; the final reply is the answer itself.
+  assert.deepEqual(seen.replies, ["Let me look."]);
+  assert.deepEqual(seen.commands, ["echo observed"]);
+  assert.equal(seen.results[0].stdout.trim(), "observed");
+});
+
+/* ------------------------------------------------------------------ */
+
+console.log(`\n${passed} passed, ${failures.length} failed\n`);
+if (failures.length > 0) {
+  for (const failure of failures) console.log(`FAILED: ${failure.name}\n${failure.error.stack}\n`);
+  process.exit(1);
+}

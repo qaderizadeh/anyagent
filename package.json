@@ -1,7 +1,7 @@
 {
   "name": "anyagent",
-  "version": "3.0.0",
-  "description": "Small personal CLI AI agent that thinks with a local Ollama model, runs shell commands, and keeps conversations on your own machine",
+  "version": "4.0.0",
+  "description": "Personal CLI agent that drives chat.deepseek.com in a real browser — a normal chat where the model writes the commands and the output gets pasted back, with no API key",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -19,10 +19,13 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node test-agent.mjs && node test-live.mjs",
     "prestart": "npm run build",
     "start": "node dist/cli.js"
   },
-  "dependencies": {},
+  "dependencies": {
+    "playwright": "^1.63.0"
+  },
   "devDependencies": {
     "@types/node": "^20.14.0",
     "typescript": "^5.5.0"

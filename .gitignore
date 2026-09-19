@@ -4,13 +4,12 @@ dist/
 .DS_Store
 .env
 
-# Credentials used by the older backends (tags v1.0.0 and v2.0.0) - never commit
+# The captured DeepSeek session - never commit a real one.
 DEEPSEEK_SESSION_JSON
 DEEPSEEK_SESSION_PATH
 
-# Conversations, if ANYAGENT_SESSIONS_DIR is pointed inside the project.
-# The default lives in ~/.anyagent/sessions, well away from the repo.
-/sessions/
+# The browser profile, if it is pointed inside the project.
+# The default lives in ~/.anyagent/browser, well away from the repo.
 .anyagent/
 
 # Local test artifacts (not part of the project)
