@@ -1,109 +1,86 @@
 # AnyAgent
 
-A small command-line AI agent that drives **chat.deepseek.com** in a real
-browser — hidden by default, signed in with the same `authorization` + `cookie`
-pair you would capture for the API.
+A small command-line AI agent that thinks with **a model on your own machine**
+through [Ollama](https://ollama.com), runs shell commands for you, and keeps
+every conversation as a plain JSON file on your disk.
 
-It runs shell commands on your machine and keeps **every conversation on
-DeepSeek's side**. Nothing is stored locally.
+No API key. No account. No cloud. Nothing leaves your computer.
 
 Part of [anydev.ir](https://anydev.ir).
 
-## Why a browser
+## Where this came from
 
-AnyAgent used to call DeepSeek's API directly from Node. That works, but the
-requests had a script's fingerprint and went out far faster than a person
-could type — and the account was flagged for it.
+AnyAgent has been through three backends, and the two old ones are still here:
 
-So the requests now come from Chromium: the prompt is put into the real
-composer and sent, and DeepSeek's own `/chat/completion` response is read off
-the wire. Same captured session as before, a real browser's fingerprint and a
-human pace.
+| Version | Backend | Kept at |
+|---|---|---|
+| **v3.0.0** | **Ollama on your machine** | `main` — this one |
+| v2.0.0 | chat.deepseek.com driven in a real browser | tag `v2.0.0`, branch `deepseek-web` |
+| v1.0.0 | DeepSeek's HTTP API from Node | tag `v1.0.0`, branch `direct-api` |
 
-The direct-HTTP version is kept, unchanged and working, on branch **`direct-api`**
-and tag **`v1.0.0`**:
+The DeepSeek versions worked, and then the account was restricted. Running the
+model locally removes that whole class of problem — no session to capture, no
+rate limit to trip, no terms of service to argue with. It also happens to be
+simpler: the v2 browser backend was 1,047 lines; this is about 700, with **zero
+runtime dependencies**.
 
 ```bash
-git checkout direct-api
+git checkout direct-api     # the original, if you ever want it
 ```
 
 ## How it works
 
 ```text
-task -> DeepSeek -> {"text", "command"} -> run one command -> result -> DeepSeek -> ... -> text
+task -> model -> {"text", "command"} -> run one command -> result -> model -> ... -> text
 ```
 
-That is the whole program. Three files:
+That is the whole program. Four small files:
 
 | File | What it is |
 |---|---|
-| `src/browser.ts` | transport: the browser, the captured session, the composer, the session list, reading the reply |
+| `src/ollama.ts` | transport: list the models, ask one of them, explain failures |
 | `src/agent.ts` | the loop, one shell command, one reply shape |
-| `src/cli.ts` | banner, session picker, REPL |
+| `src/sessions.ts` | conversations on disk |
+| `src/cli.ts` | banner, conversation picker, REPL |
 
-### No local state
+### The reply is a schema, not a hope
 
-The chat that is open in the browser is the conversation. Sessions and messages
-live on chat.deepseek.com, so you can close the terminal, run AnyAgent on
-another machine, or edit the conversation on the website — it is the same
-conversation.
-
-Two things sit on disk, and neither is a conversation: your captured session
-(`DEEPSEEK_SESSION_JSON`, git-ignored) and the browser profile.
+Every request tells Ollama the exact shape it will accept, as a JSON schema.
+Ollama turns that into a grammar, so the model **cannot** answer with prose, a
+code fence, or a "Sure, here you go" — however small the model is. That is why
+this project has no parsing heuristics and no retry storm.
 
 ## Requirements
 
 - Node.js 20+
-- A browser. AnyAgent uses a **Chrome, Edge or Chromium already on the
-  machine**, and only falls back to its own download when there is none:
-  `npx playwright install chromium`.
+- [Ollama](https://ollama.com/download), running, with at least one model:
+  ```bash
+  ollama serve
+  ollama pull llama3.2
+  ```
 
-  Firefox is not supported: Playwright can only drive its own patched build of
-  Firefox, so a Firefox you have installed cannot be used here.
-- A shell. Linux and macOS already have `bash`. On Windows AnyAgent uses a Git
-  Bash if one is on your `PATH` and `cmd.exe` otherwise. Set `ANYAGENT_SHELL`
-  to a path or a name to pick a different one.
+Any model works. Bigger models make fewer mistakes; models with tool-calling or
+thinking training get more out of it. Small ones are fine — the reply shape is
+guaranteed by the schema, not by the model's manners.
 
 ## Setup
 
 ```bash
 npm install
-npx playwright install chromium     # only if you have no Chrome, Edge or Chromium
+npm start
 ```
 
-### Capture your session
-
-1. Open <https://chat.deepseek.com> and sign in.
-2. Open DevTools → **Network**, and click any request to `/api/v0/...`
-   (`create_pow_challenge` is a good pick).
-3. Under **Request Headers**, copy the values of `authorization` and `cookie`.
-4. Save them next to the project as `DEEPSEEK_SESSION_JSON`:
-
-```json
-{
-  "authorization": "Bearer <token>",
-  "cookie": "ds_session_id=<...>; ..."
-}
-```
-
-That is all AnyAgent needs — the same pair the direct-HTTP version used.
-(`token` is accepted as an alias for `authorization`, and `cookies` for
-`cookie`; a cookie name→value map works too.)
-
-> Re-capture when DeepSeek signs you out. The `aws-waf-token` cookie inside
-> `cookie` is usually the one that expires first.
-
-**Or sign in by hand instead.** With no credentials file, AnyAgent uses the
-browser profile: run once with `ANYAGENT_HEADLESS=0`, sign in in the window
-that opens, and every later run is signed in already.
+`npm install` pulls dev dependencies only TypeScript needs. There is nothing to
+download at runtime, no browser, no wasm.
 
 ## Usage
 
 ```bash
-anyagent                     # pick a session (or start one) and chat
+anyagent                     # pick a conversation (or start one) and chat
 anyagent "list the largest files here"
-anyagent --new               # force a brand-new session
-anyagent --session <id>      # continue a specific session
+anyagent --new               # force a brand-new conversation
+anyagent --session ID        # continue a saved conversation
+anyagent --model qwen2.5:7b  # use a specific model
 anyagent --cwd ~/project     # run commands in another directory
 ```
 
@@ -111,8 +88,8 @@ In the REPL:
 
 ```text
 /help       show commands
-/sessions   list DeepSeek sessions and switch to one
-/new        start a new DeepSeek session
+/sessions   list saved conversations and switch to one
+/new        start a new conversation
 /exit       quit (also Ctrl+C, Ctrl+D)
 ```
 
@@ -120,43 +97,59 @@ Example:
 
 ```text
 > create a file called hello.txt containing "Hello World"
-  · Writing the file now.
+  · Writing it now.
   -> shell: printf 'Hello World' > hello.txt
      ok
 Done. Created hello.txt with "Hello World".
-(4.1s)
+(6.2s, 4 msgs)
 ```
 
 ## Environment variables
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DEEPSEEK_SESSION_JSON` | — | captured session as inline JSON |
-| `DEEPSEEK_SESSION_PATH` | — | path to a captured session file |
-| `ANYAGENT_HEADLESS` | `1` | `0` shows the browser window |
-| `ANYAGENT_BROWSER_PATH` | auto-detected | a specific browser binary to use |
-| `ANYAGENT_PROFILE_DIR` | `~/.anyagent/browser` | browser profile, used when there is no credentials file |
-| `ANYAGENT_PACE_MS` | `300` | pause before each prompt: a fast person, not a machine |
-| `ANYAGENT_COMPLETION_TIMEOUT_MS` | `300000` | how long one turn may take |
-| `ANYAGENT_LOGIN_TIMEOUT_MS` | `300000` | how long to wait for a hand sign-in |
+| `OLLAMA_URL` | `http://127.0.0.1:11434` | where Ollama listens |
+| `OLLAMA_MODEL` | — | model to use (otherwise: the only one installed, or a choice) |
+| `OLLAMA_TIMEOUT_MS` | `300000` | how long one reply may take |
+| `ANYAGENT_THINKING` | the model's own | `1`/`0` to force thinking on or off |
 | `ANYAGENT_SHELL` | `bash`, or `cmd.exe` on Windows | shell commands run in |
-| `DEEPSEEK_THINKING_ENABLED` | `1` | deep thinking |
-| `DEEPSEEK_SEARCH_ENABLED` | `0` | web search |
-| `DEEPSEEK_MAX_ITERATIONS` | `50` | loop limit per task |
-| `DEEPSEEK_SHELL_TIMEOUT_MS` | `120000` | per-command timeout |
+| `ANYAGENT_MAX_ITERATIONS` | `50` | steps allowed per task |
+| `ANYAGENT_SHELL_TIMEOUT_MS` | `120000` | per-command timeout |
+| `ANYAGENT_CONTEXT_MESSAGES` | `24` | how much history travels with each request |
+| `ANYAGENT_SESSIONS_DIR` | `~/.anyagent/sessions` | where conversations are saved |
+
+`ANYAGENT_THINKING` is left unset on purpose. Ollama's `think` flag only works
+on models built for it, so the model's own default is the right answer unless
+you ask for something else. Setting it on a model that cannot think gives you a
+message that says exactly that, rather than a cryptic 400.
+
+## Conversations
+
+Ollama keeps no state at all — every request carries the whole conversation —
+so the conversation lives in `~/.anyagent/sessions/<id>.json`, one small file
+per conversation, saved after every task. That is the only thing on disk.
+
+That buys you something the DeepSeek versions could not do: your conversations
+are yours, readable, and work offline. Copy a file to another machine and the
+conversation goes with it. Delete a file and the conversation is gone.
+
+```json
+{"id":"20260918-153012","title":"create a file called hello.txt","updatedAt":1787000000000,
+ "messages":[{"role":"user","content":"create a file called hello.txt"}, ...]}
+```
 
 ## The reply
 
-The agent has exactly one answer shape. Every model turn is one JSON object
-with a note for you and one command:
+The agent has exactly one answer shape. Every model turn is one JSON object with
+a note for you and one command:
 
 ```json
 {"text": "listing the directory", "command": "ls -la"}
 ```
 
 One command per turn. The result goes back as
-`{"exitCode":0,"stdout":"...","stderr":"..."}`; a failing command does not
-stop the agent — the error goes back to the model, which decides what to do.
+`{"exitCode":0,"stdout":"...","stderr":"..."}`; a failing command does not stop
+the agent — the error goes back to the model, which decides what to do.
 
 `text` is printed for **every** step, so nothing the model says is hidden:
 
@@ -167,46 +160,26 @@ stop the agent — the error goes back to the model, which decides what to do.
 ```
 
 An **empty or missing `command` means the turn is over**: the task is done, or
-the agent is blocked and needs you. Either way `text` is shown to you and the
-agent stops.
-
-If a reply is not this shape, the model is asked again. When it still cannot go
-on, the message says which of the two things happened: **nothing came back**
-(the turn is retried after a short delay) or a **wrong shape** (the offending
-reply is printed).
-
-### Losing a reply
-
-The stream is the longest-lived part of a turn, so it is the first thing a
-flaky connection breaks. DeepSeek carries on and stores the finished answer
-anyway, so an empty turn is looked up in the chat's history before anything
-else happens — a hiccup does not throw the model's work away. A turn that was
-never stored at all is detected within a few seconds and retried.
+the agent is blocked and needs you. Either way `text` is shown and the agent
+stops.
 
 ## Notes
 
-- **The browser is found for you.** AnyAgent uses a Chrome, Edge or Chromium
-  already on the machine, and only falls back to Playwright's own download when
-  there is none. The banner names the one it picked — `Backend: ... (Chromium,
-  hidden)` — so you can see what is actually running.
-- **A dead session is caught at startup.** The page can render a message box
-  from cached state after the session behind it has expired, so AnyAgent checks
-  with the backend before it starts. An expired capture gets the re-capture
-  message, not a failure halfway through a task.
-- **Nothing is typed.** The prompt goes into the composer in one go, the way a
-  paste does, and Enter sends it. `ANYAGENT_PACE_MS` is the only delay, and it
-  is short on purpose.
-- **Thinking and search** are per-message switches in the composer. AnyAgent
-  sets them on the completion request itself rather than clicking a button
-  whose markup it would have to guess at, so `DEEPSEEK_THINKING_ENABLED` and
-  `DEEPSEEK_SEARCH_ENABLED` apply to every turn.
-- **Reads** (the session list, a chat's history) go through the page's own
-  `fetch`, so they carry the browser's session too. Only the reply is read off
-  the wire.
-- **One browser at a time.** The profile is locked while AnyAgent runs, so
-  don't start a second copy against the same profile.
-- `dist/` is build output and is not tracked, but `npm start` compiles first,
-  so `git pull && npm start` is always up to date.
+- **Long conversations get trimmed, not broken.** Local models have small
+  contexts, so each request carries the system prompt and the last
+  `ANYAGENT_CONTEXT_MESSAGES` messages. A 40-step task will not fail because the
+  model cannot read 40 steps at once.
+- **Command output is clipped** at 8,000 characters, with a note saying how much
+  was cut. A local model cannot usefully read more than that in one go.
+- **The shell is the platform's own.** `bash` on Linux and macOS, a Git Bash if
+  one is on your Windows `PATH` and `cmd.exe` otherwise. The system prompt names
+  the OS and the shell, so the model writes commands that actually run.
+- **A command that never starts says why.** If the shell itself is missing you
+  get `spawn /bin/bash ENOENT` in the step output instead of a bare `exit 1`.
+- **Downloads once, then works offline.** Ollama keeps the model in memory for
+  five minutes after each request by default, so a conversation stays quick.
+- `dist/` is build output and is not tracked, but `npm start` compiles first, so
+  `git pull && npm start` is always up to date.
 
 ## Security
 
@@ -215,8 +188,7 @@ working directory is wherever you point `--cwd`. There is no sandbox.
 
 - Only run it in a directory/environment you trust.
 - It never listens on a network port and exposes no service.
-- `DEEPSEEK_SESSION_JSON` is equivalent to your DeepSeek login — keep it out of
-  version control (it is already in `.gitignore`).
+- Nothing is sent anywhere except to your own Ollama at `OLLAMA_URL`.
 - Commands run one at a time, so you can interrupt with Ctrl+C.
 
 ## License

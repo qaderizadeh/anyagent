@@ -3,24 +3,24 @@
  *
  *   task -> model -> {"text": "...", "command": "..."} -> run one command -> ...
  *
- * No conversation state lives here. The chat is the one open in the browser
- * window, and everything in it stays on chat.deepseek.com.
+ * The agent owns the conversation, because Ollama has no memory of its own:
+ * every request carries the messages. Everything else is the model's job.
  */
 
 import { exec } from "node:child_process";
 import { existsSync } from "node:fs";
 import * as path from "node:path";
-import type { Browser, Completion } from "./browser.js";
 
-const MAX_STEPS = intEnv("DEEPSEEK_MAX_ITERATIONS", 50);
-const SHELL_TIMEOUT_MS = intEnv("DEEPSEEK_SHELL_TIMEOUT_MS", 120_000);
-const MAX_OUTPUT_CHARS = 30_000;
+import type { Message, Ollama } from "./ollama.js";
+
+const MAX_STEPS = intEnv("ANYAGENT_MAX_ITERATIONS", 50);
+const SHELL_TIMEOUT_MS = intEnv("ANYAGENT_SHELL_TIMEOUT_MS", 120_000);
+/** How many past messages travel with each request. Local models have small contexts. */
+const CONTEXT_MESSAGES = intEnv("ANYAGENT_CONTEXT_MESSAGES", 24);
+/** A command's output is clipped: a local model cannot read 30k of it anyway. */
+const MAX_OUTPUT_CHARS = 8_000;
 /** Extra attempts allowed for a reply we cannot use. */
 const MAX_RETRIES = 2;
-/** Wait before asking again when nothing came back (it may be a hiccup). */
-const RETRY_DELAY_MS = 2_000;
-
-const sleep = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
 
 function intEnv(name: string, fallback: number): number {
   const value = Number(process.env[name]);
@@ -54,11 +54,17 @@ export function shellName(): string {
   return file.replace(/\.exe$/i, "");
 }
 
-/** The one answer shape. Sent with every task, so it wins over older history. */
-export function header(): string {
+/**
+ * The one answer shape, as a system message.
+ *
+ * Ollama also enforces this as a JSON schema, so the shape is guaranteed; this
+ * prompt is what tells the model what the *words* mean.
+ */
+export function header(cwd: string): string {
   const shell = shellName();
   return [
     `You are a command-line agent on the user's ${OS_NAME} computer. Commands run in ${shell}, one at a time.`,
+    `The working directory is ${cwd}, and commands start there.`,
     "Always reply with one JSON object in exactly this shape and nothing else -",
     "no prose, no markdown, no code fence:",
     `{"text": "short note for the user", "command": "the ${shell} command to run"}`,
@@ -100,8 +106,7 @@ export function runShell(command: string, cwd: string): Promise<ShellResult> {
       },
       (error, stdout, stderr) => {
         const failure = error as (Error & { code?: number | string; killed?: boolean }) | null;
-        const exitCode =
-          failure == null ? 0 : typeof failure.code === "number" ? failure.code : 1;
+        const exitCode = failure == null ? 0 : typeof failure.code === "number" ? failure.code : 1;
         // A shell that never started reports itself only in the error, so keep
         // that too - otherwise the failure is just "exit 1" with no reason.
         const missing = failure != null && typeof failure.code === "string" ? failure.message : "";
@@ -109,9 +114,7 @@ export function runShell(command: string, cwd: string): Promise<ShellResult> {
         resolve({
           exitCode,
           stdout: clip(String(stdout)),
-          stderr: clip(
-            [String(stderr).trim(), missing, killed].filter((part) => part !== "").join("\n"),
-          ),
+          stderr: clip([String(stderr).trim(), missing, killed].filter((part) => part !== "").join("\n")),
         });
       },
     );
@@ -132,7 +135,7 @@ export type Reply = {
 function asObject(text: string): Record<string, unknown> | null {
   try {
     const value: unknown = JSON.parse(text);
-    return value && typeof value === "object" && !Array.isArray(value)
+    return value !== null && typeof value === "object" && !Array.isArray(value)
       ? (value as Record<string, unknown>)
       : null;
   } catch {
@@ -142,17 +145,16 @@ function asObject(text: string): Record<string, unknown> | null {
 
 /** Read {"text","command"} out of a reply. Returns null if there is none. */
 export function parseReply(reply: string): Reply | null {
-  // Models like to wrap the object in a fence or in a sentence around it.
+  // The schema makes this valid JSON already; older Ollama builds and some
+  // models still wrap it in a fence or a sentence, so look inside too.
   const body = reply.replace(/```[a-z]*\s*/gi, "").trim();
   const start = body.indexOf("{");
   const end = body.lastIndexOf("}");
   const wrapped = start >= 0 && end > start ? body.slice(start, end + 1) : body;
   const object = asObject(body) ?? asObject(wrapped);
-  if (object == null) return null;
+  if (object === null) return null;
 
-  const field = (value: unknown): string =>
-    typeof value === "string" ? value.trim() : "";
-
+  const field = (value: unknown): string => (typeof value === "string" ? value.trim() : "");
   return { text: field(object["text"]), command: field(object["command"]) };
 }
 
@@ -169,65 +171,49 @@ export type AgentEvents = {
 
 export class Agent {
   constructor(
-    private readonly browser: Browser,
+    private readonly ollama: Ollama,
     private readonly cwd: string,
+    /** The conversation, without the system message. Kept by reference. */
+    private readonly messages: Message[],
   ) {}
 
-  get id(): string {
-    return this.browser.currentChatId();
+  get history(): Message[] {
+    return this.messages;
   }
 
-  /** Continue an existing chat session. */
-  async openSession(chatId: string): Promise<void> {
-    await this.browser.openSession(chatId);
-  }
-
-  /** Start a new chat session. */
-  async newSession(): Promise<void> {
-    await this.browser.newSession();
+  /** What Ollama is asked this turn: the prompt, then the recent conversation. */
+  private request(): Message[] {
+    return [
+      { role: "system", content: header(this.cwd) },
+      ...this.messages.slice(-CONTEXT_MESSAGES),
+    ];
   }
 
   async run(task: string, events: AgentEvents = {}): Promise<string> {
-    let prompt = `${header()}\n\nTask: ${task}`;
-    let quiet = 0; // nothing came back from the model
-    let garbled = 0; // it answered, but not in the one shape we accept
+    this.messages.push({ role: "user", content: task });
+    let unusable = 0;
 
     for (let step = 0; step < MAX_STEPS; step++) {
-      const reply: Completion = await this.browser.ask(prompt);
-      const raw = reply.text.trim();
+      const raw = (await this.ollama.chat(this.request())).trim();
       const parsed = parseReply(raw);
 
-      // Nothing usable came back. Two different faults, two different answers:
-      // an empty reply is the connection or the backend (its answer, if any, was
-      // already looked up on chat.deepseek.com), so ask the same thing again; a
-      // reply in some other shape is the model's, so ask for the shape.
-      if (parsed == null || (parsed.text === "" && parsed.command === "")) {
-        if (raw === "") {
-          quiet += 1;
-          if (quiet > MAX_RETRIES) {
-            throw new Error(
-              `Nothing came back from DeepSeek ${quiet} times in a row, so the task stopped here.\n` +
-                "No reply arrived and none was stored on the backend, so there is nothing to recover.\n" +
-                "Your chat is intact on chat.deepseek.com - send the task again, or use /new.",
-            );
-          }
-          await sleep(RETRY_DELAY_MS * quiet);
-        } else {
-          garbled += 1;
-          if (garbled > MAX_RETRIES) {
-            throw new Error(
-              'DeepSeek never sent one {"text","command"} object, so the task stopped here.\n' +
-                "Its last reply was:\n" +
-                raw.slice(0, 400),
-            );
-          }
-          prompt = NUDGE;
+      if (parsed === null || (parsed.text === "" && parsed.command === "")) {
+        unusable += 1;
+        if (unusable > MAX_RETRIES) {
+          throw new Error(
+            parsed === null
+              ? "The model never answered with one {\"text\",\"command\"} object, so the task stopped here.\n" +
+                  `Its last reply was:\n${raw === "" ? "(nothing at all)" : raw.slice(0, 400)}`
+              : "The model answered with an empty reply three times in a row, so the task stopped here.\n" +
+                  "The conversation is saved - try again, or /new with a smaller model.",
+          );
         }
+        this.messages.push({ role: "user", content: NUDGE });
         continue;
       }
 
-      quiet = 0;
-      garbled = 0;
+      unusable = 0;
+      this.messages.push({ role: "assistant", content: raw });
 
       // An empty command is the agent's way of saying it is done or blocked.
       if (parsed.command === "") return parsed.text;
@@ -236,7 +222,7 @@ export class Agent {
       events.onTool?.(parsed.command);
       const result = await runShell(parsed.command, this.cwd);
       events.onToolResult?.(result);
-      prompt = `Result:\n${JSON.stringify(result)}`;
+      this.messages.push({ role: "user", content: `Result:\n${JSON.stringify(result)}` });
     }
 
     return "Agent stopped: maximum iterations reached.";

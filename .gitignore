@@ -4,9 +4,14 @@ dist/
 .DS_Store
 .env
 
-# Credentials used by the `direct-api` branch (v1.0.0) - never commit these
+# Credentials used by the older backends (tags v1.0.0 and v2.0.0) - never commit
 DEEPSEEK_SESSION_JSON
 DEEPSEEK_SESSION_PATH
+
+# Conversations, if ANYAGENT_SESSIONS_DIR is pointed inside the project.
+# The default lives in ~/.anyagent/sessions, well away from the repo.
+/sessions/
+.anyagent/
 
 # Local test artifacts (not part of the project)
 /my-express-app/

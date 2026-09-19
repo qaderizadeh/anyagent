@@ -1,7 +1,7 @@
 {
   "name": "anyagent",
-  "version": "2.0.0",
-  "description": "Personal CLI AI agent that drives chat.deepseek.com in a real browser — no API key, conversations stay on DeepSeek's side",
+  "version": "3.0.0",
+  "description": "Small personal CLI AI agent that thinks with a local Ollama model, runs shell commands, and keeps conversations on your own machine",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -22,9 +22,7 @@
     "prestart": "npm run build",
     "start": "node dist/cli.js"
   },
-  "dependencies": {
-    "playwright": "^1.63.0"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@types/node": "^20.14.0",
     "typescript": "^5.5.0"

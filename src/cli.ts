@@ -1,18 +1,17 @@
 #!/usr/bin/env node
 /**
- * AnyAgent - a small CLI agent on chat.deepseek.com.
+ * AnyAgent - a small CLI agent on Ollama.
  *
- *   anyagent                  pick a session (or start one) and chat
+ *   anyagent                  pick a conversation (or start one) and chat
  *   anyagent "task"           run one task and exit
- *   anyagent --new            force a brand-new session
- *   anyagent --session ID     continue a specific session
+ *   anyagent --new            start a new conversation
+ *   anyagent --session ID     continue a conversation
+ *   anyagent --model NAME     use a specific model
  *   anyagent --cwd DIR        working directory for the commands
  *
- * Everything runs through a real Chromium, hidden by default. The sign-in is
- * the captured authorization + cookie from DEEPSEEK_SESSION_JSON, put into the
- * browser before the page loads; with no such file the browser profile is used
- * and you sign in once in a visible window. Sessions and messages live on
- * chat.deepseek.com - nothing is stored locally.
+ * The model runs on your own machine through Ollama. Conversations are saved as
+ * small JSON files under ~/.anyagent/sessions; nothing is sent anywhere except
+ * to your Ollama.
  */
 
 import { createInterface } from "node:readline/promises";
@@ -20,39 +19,49 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { Agent, shellName } from "./agent.js";
-import { Browser, modes, type ChatSession } from "./browser.js";
+import { Ollama, baseUrl, thinkingLabel } from "./ollama.js";
+import {
+  listSessions,
+  newSession,
+  readSession,
+  saveSession,
+  titleFor,
+  type Session,
+  type SessionMeta,
+} from "./sessions.js";
 
 const dim = (text: string): string => (process.stdout.isTTY ? `\x1b[2m${text}\x1b[0m` : text);
 const bold = (text: string): string => (process.stdout.isTTY ? `\x1b[1m${text}\x1b[0m` : text);
 
 const HELP = `Commands:
   /help       show this
-  /sessions   list DeepSeek sessions and switch
-  /new        start a new DeepSeek session
+  /sessions   list saved conversations and switch
+  /new        start a new conversation
   /exit       quit (also Ctrl+C, Ctrl+D)
 
 Usage:
-  anyagent                  pick a session and chat
+  anyagent                  pick a conversation and chat
   anyagent "task"           run one task and exit
-  anyagent --new            new session
-  anyagent --session ID     continue a session
+  anyagent --new            new conversation
+  anyagent --session ID     continue a conversation
+  anyagent --model NAME     use a specific model
   anyagent --cwd DIR        working directory
 
 Env:
-  DEEPSEEK_SESSION_JSON      captured authorization + cookie (or DEEPSEEK_SESSION_PATH)
-  ANYAGENT_PROFILE_DIR       browser profile, used when there is no credentials file
-  ANYAGENT_HEADLESS          "0" to show the browser window (default: hidden)
-  ANYAGENT_BROWSER_PATH      pick a browser by hand (default: any Chrome, Edge or Chromium found)
-  ANYAGENT_PACE_MS           pause before each prompt (default: 300)
-  DEEPSEEK_THINKING_ENABLED  deep thinking (default: on)
-  DEEPSEEK_SEARCH_ENABLED    web search (default: off)
-  DEEPSEEK_MAX_ITERATIONS    loop limit (default: 50)
+  OLLAMA_URL                 where Ollama listens (default ${baseUrl()})
+  OLLAMA_MODEL               model to use (default: ask, or the only one installed)
+  OLLAMA_TIMEOUT_MS          how long one reply may take (default 300000)
+  ANYAGENT_THINKING          1/0 to force thinking mode (default: the model's own)
   ANYAGENT_SHELL             shell to run commands in (default: bash, cmd.exe on Windows)
-  DEEPSEEK_SHELL_TIMEOUT_MS  command timeout (default: 120000)`;
+  ANYAGENT_MAX_ITERATIONS    loop limit per task (default: 50)
+  ANYAGENT_SHELL_TIMEOUT_MS  per-command timeout (default: 120000)
+  ANYAGENT_CONTEXT_MESSAGES  history sent with each request (default: 24)
+  ANYAGENT_SESSIONS_DIR      where conversations are saved (default ~/.anyagent/sessions)`;
 
 type Args = {
   cwd: string;
   session?: string;
+  model?: string;
   fresh: boolean;
   task?: string;
   help: boolean;
@@ -113,6 +122,7 @@ function parseArgs(argv: string[]): Args {
     const flag = argv[i]!;
     if (flag === "--cwd" || flag === "-C") args.cwd = argv[++i] ?? args.cwd;
     else if (flag === "--session" || flag === "-s") args.session = argv[++i];
+    else if (flag === "--model" || flag === "-m") args.model = argv[++i];
     else if (flag === "--new" || flag === "-n") args.fresh = true;
     else if (flag === "--help" || flag === "-h") args.help = true;
     else rest.push(flag);
@@ -121,9 +131,9 @@ function parseArgs(argv: string[]): Args {
   return args;
 }
 
-function when(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds <= 0) return "                 ";
-  return new Date(seconds * 1000).toISOString().slice(0, 16).replace("T", " ");
+function when(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "                 ";
+  return new Date(ms).toISOString().slice(0, 16).replace("T", " ");
 }
 
 function oneLine(text: string, max = 100): string {
@@ -131,16 +141,54 @@ function oneLine(text: string, max = 100): string {
   return flat.length > max ? `${flat.slice(0, max)}...` : flat;
 }
 
-function printSessions(list: ChatSession[]): void {
-  console.log(dim("Sessions on chat.deepseek.com:"));
-  list.forEach((item, index) => {
-    console.log(`  [${index + 1}] ${when(item.updatedAt)}  ${oneLine(item.title, 70)}`);
-  });
-  console.log("  [0] start a new session\n");
+export function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+function printSessions(list: SessionMeta[]): void {
+  console.log(dim("Saved conversations:"));
+  list.forEach((item, index) => {
+    console.log(
+      `  [${index + 1}] ${when(item.updatedAt)}  ${oneLine(item.title, 60)}  (${item.count} msgs)`,
+    );
+  });
+  console.log("  [0] start a new conversation\n");
+}
+
+/**
+ * Which model to use: the one you named, the only one installed, or a choice.
+ * Ollama's own "model not found" is late and vague, so this catches it early.
+ */
+async function resolveModel(requested: string | undefined, interactive: boolean): Promise<string> {
+  const installed = await Ollama.models();
+  const wanted = (requested ?? process.env["OLLAMA_MODEL"] ?? "").trim();
+  const known = (name: string): boolean =>
+    installed.length === 0 || installed.includes(name) || installed.some((item) => item.startsWith(`${name}:`));
+
+  if (wanted !== "") {
+    if (!known(wanted)) {
+      throw new Error(
+        `Ollama does not have the model "${wanted}".\n\n` +
+          `Installed models:\n${installed.map((name) => `  ${name}`).join("\n")}\n\n` +
+          `Pull it first:\n  ollama pull ${wanted}`,
+      );
+    }
+    return wanted;
+  }
+
+  if (installed.length === 0) {
+    throw new Error(
+      "Ollama has no models installed.\n\nPull one first:\n  ollama pull llama3.2",
+    );
+  }
+  if (installed.length === 1 || !interactive) return installed[0]!;
+
+  console.log(dim("Models installed:"));
+  installed.forEach((name, index) => console.log(`  [${index + 1}] ${name}`));
+  console.log();
+  const picked = await ask(`Pick a model [1]: `);
+  const choice = Number((picked ?? "1").trim() === "" ? "1" : (picked ?? "1").trim());
+  return installed[Number.isInteger(choice) && choice >= 1 && choice <= installed.length ? choice - 1 : 0]!;
 }
 
 async function main(): Promise<void> {
@@ -155,43 +203,48 @@ async function main(): Promise<void> {
     throw new Error(`Working directory does not exist: ${cwd}`);
   }
 
-  const browser = await Browser.open((text) => console.log(dim(text)));
-  try {
-    await run(args, browser, cwd);
-  } finally {
-    await browser.close();
-  }
-}
+  const model = await resolveModel(args.model, args.task == null);
+  const ollama = new Ollama(model);
 
-async function run(args: Args, browser: Browser, cwd: string): Promise<void> {
-  const agent = new Agent(browser, cwd);
-  const list = await browser.listSessions(10);
-
+  let session: Session;
   if (args.session != null) {
-    await agent.openSession(args.session);
+    const found = readSession(args.session);
+    if (found === null) {
+      const saved = listSessions();
+      throw new Error(
+        `No saved conversation "${args.session}".\n\n` +
+          (saved.length > 0
+            ? `Saved conversations:\n${saved.map((item) => `  ${item.id}  ${oneLine(item.title, 50)}`).join("\n")}`
+            : "There are none yet - run anyagent without --session to start one."),
+      );
+    }
+    session = found;
   } else if (args.fresh || args.task != null) {
-    await agent.newSession();
+    session = newSession();
   } else {
-    if (list.length > 0) printSessions(list);
-    const asked = await ask(list.length > 0 ? "Pick [0]: " : "Start a new session? [y]: ");
-    if (asked === null) return;
-    const choice = Number(asked.trim() === "" ? "0" : asked.trim());
-    const picked =
-      Number.isInteger(choice) && choice >= 1 && choice <= list.length
-        ? list[choice - 1]!.id
-        : undefined;
-    if (picked === undefined) await agent.newSession();
-    else await agent.openSession(picked);
+    const saved = listSessions();
+    let picked: string | undefined;
+    if (saved.length > 0) {
+      printSessions(saved);
+      const choice = Number(((await ask("Pick [0]: ")) ?? "0").trim() || "0");
+      if (Number.isInteger(choice) && choice >= 1 && choice <= saved.length) {
+        picked = saved[choice - 1]!.id;
+      }
+    } else {
+      const start = await ask("Start a new conversation? [y]: ");
+      if (start === null) return;
+    }
+    session = picked === undefined ? newSession() : (readSession(picked) ?? newSession());
   }
 
-  const { thinking, search } = modes();
+  let agent = new Agent(ollama, cwd, session.messages);
+
   console.log(bold("AnyAgent"));
   console.log("────────────────────────────");
-  console.log(`${dim("Backend:  ")} chat.deepseek.com (${browser.mode})`);
-  console.log(`${dim("Login:    ")} ${browser.login}`);
-  console.log(`${dim("Session:  ")} ${agent.id || "(new chat)"}`);
-  console.log(`${dim("Thinking: ")} ${thinking ? "enabled" : "disabled"}`);
-  console.log(`${dim("Search:   ")} ${search ? "enabled" : "disabled"}`);
+  console.log(`${dim("Backend:  ")} Ollama at ${ollama.url}`);
+  console.log(`${dim("Model:    ")} ${model}`);
+  console.log(`${dim("Session:  ")} ${session.id}${session.title === "" ? "" : `  "${oneLine(session.title, 50)}"`}`);
+  console.log(`${dim("Thinking: ")} ${thinkingLabel()}`);
   console.log(`${dim("Shell:    ")} ${shellName()}`);
   console.log(`${dim("Directory:")} ${cwd}`);
   console.log();
@@ -200,6 +253,7 @@ async function run(args: Args, browser: Browser, cwd: string): Promise<void> {
   console.log();
 
   const runTask = async (task: string): Promise<void> => {
+    if (session.title === "") session.title = titleFor(task);
     const started = Date.now();
     busy = true;
     let answer: string;
@@ -217,11 +271,15 @@ async function run(args: Args, browser: Browser, cwd: string): Promise<void> {
         },
       });
     } finally {
+      // Saved even when the task failed, so no step is lost.
       busy = false;
+      saveSession(session);
     }
     console.log();
     console.log(answer);
-    console.log(dim(`(${((Date.now() - started) / 1000).toFixed(1)}s)`));
+    console.log(
+      dim(`(${((Date.now() - started) / 1000).toFixed(1)}s, ${session.messages.length} msgs)`),
+    );
   };
 
   if (args.task != null) {
@@ -229,7 +287,7 @@ async function run(args: Args, browser: Browser, cwd: string): Promise<void> {
     return;
   }
 
-  console.log(dim("Type a task, or /help.\n"));
+  console.log(dim(`Type a task, or /help. Saved as ${session.id}.\n`));
   for (;;) {
     const line = await ask("> ");
     if (line === null) break; // Ctrl+D / end of input
@@ -257,24 +315,28 @@ async function run(args: Args, browser: Browser, cwd: string): Promise<void> {
     }
 
     if (command === "new") {
-      await agent.newSession();
-      console.log(dim("Started a new DeepSeek session."));
+      session = newSession();
+      agent = new Agent(ollama, cwd, session.messages);
+      console.log(dim(`Started a new conversation: ${session.id}`));
       continue;
     }
 
     if (command === "sessions") {
-      const fresh = await browser.listSessions();
-      if (fresh.length === 0) {
-        console.log(dim("No sessions on the backend yet."));
+      const saved = listSessions();
+      if (saved.length === 0) {
+        console.log(dim("No saved conversations yet."));
         continue;
       }
-      printSessions(fresh);
-      const asked = await ask("Continue which? [0 = cancel]: ");
-      const choice = Number((asked ?? "0").trim());
-      if (Number.isInteger(choice) && choice >= 1 && choice <= fresh.length) {
-        const chosen = fresh[choice - 1]!;
-        await agent.openSession(chosen.id);
-        console.log(dim(`Continuing "${oneLine(chosen.title, 60)}".`));
+      printSessions(saved);
+      const choice = Number(((await ask("Continue which? [0 = cancel]: ")) ?? "0").trim() || "0");
+      if (Number.isInteger(choice) && choice >= 1 && choice <= saved.length) {
+        const chosen = saved[choice - 1]!;
+        const loaded = readSession(chosen.id);
+        if (loaded !== null) {
+          session = loaded;
+          agent = new Agent(ollama, cwd, session.messages);
+          console.log(dim(`Continuing "${oneLine(chosen.title, 60)}" (${session.messages.length} msgs).`));
+        }
       }
       continue;
     }
