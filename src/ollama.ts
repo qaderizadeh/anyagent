@@ -19,11 +19,13 @@ const REPLY_SCHEMA = {
   properties: {
     text: {
       type: "string",
-      description: "A short note for the user about what you are doing, or your final answer.",
+      description:
+        "A short note for the user about the step you are taking, or your final answer when there is no command.",
     },
     command: {
       type: "string",
-      description: "One shell command to run. Empty when the task is done or you need the user.",
+      description:
+        "The one shell command to run next. Running commands is how you inspect or change the user's machine, so use this whenever the task needs a fact about that machine. Empty only when the task is finished or you are truly blocked.",
     },
   },
   required: ["text", "command"],
