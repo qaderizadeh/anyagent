@@ -14,7 +14,8 @@ import * as path from "node:path";
 process.env.DEEPSEEK_MAX_ITERATIONS = "6";
 process.env.DEEPSEEK_SHELL_TIMEOUT_MS = "1500";
 
-const { Agent, commandIn, proseOf, paste, setup, shellName } = await import("./dist/agent.js");
+const { Agent, commandIn, isWslStub, paste, proseOf, resolveShell, runShell, setup, shellFor, shellName } =
+  await import("./dist/agent.js");
 
 let passed = 0;
 const failures = [];
@@ -126,6 +127,65 @@ test("prefers a shell block over a non-shell one", () => {
 
 test("does not treat an inline code span as a block", () => {
   assert.equal(commandIn("Use ```bash``` for that."), "");
+});
+
+/* ------------------------------------------------------------------ */
+console.log("\n== Windows ==\n");
+/* ------------------------------------------------------------------ */
+
+test("takes the command out of a block fenced for Windows", () => {
+  for (const tag of ["cmd", "bat", "batch", "dos", "powershell", "ps1", "pwsh"]) {
+    assert.equal(commandIn(`\`\`\`${tag}\ndir\n\`\`\``), "dir", tag);
+  }
+});
+
+test("runs a Windows block in the shell it names", () => {
+  assert.match(shellFor("cmd", true), /cmd(\.exe)?$/i);
+  assert.match(shellFor("bat", true), /cmd(\.exe)?$/i);
+  assert.match(shellFor("powershell", true), /powershell\.exe$/i);
+  assert.match(shellFor("ps1", true), /powershell\.exe$/i);
+});
+
+test("leaves a bash block to the default shell on Windows", () => {
+  assert.equal(shellFor("bash", true), undefined);
+  assert.equal(shellFor("", true), undefined);
+});
+
+test("has only one shell to choose between off Windows", () => {
+  for (const tag of ["bash", "cmd", "powershell"]) assert.equal(shellFor(tag, false), undefined, tag);
+});
+
+test("never mistakes the WSL launcher for a usable shell", () => {
+  assert.equal(isWslStub("C:\\Windows\\System32\\bash.exe"), true);
+  assert.equal(isWslStub("C:\\Windows\\SysWOW64\\bash.exe"), true);
+  assert.equal(isWslStub("C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\bash.exe"), true);
+  assert.equal(isWslStub("C:/Program Files/Git/bin/bash.exe"), false);
+  assert.equal(isWslStub("C:\\msys64\\usr\\bin\\bash.exe"), false);
+});
+
+test("picks a shell that can actually run a command", () => {
+  const shell = resolveShell();
+  assert.ok(shell.length > 0);
+  assert.equal(isWslStub(shell), false, `resolved shell must be usable, got ${shell}`);
+});
+
+test("drops a Windows prompt copied into the block", () => {
+  assert.equal(commandIn("```cmd\nC:\\Users\\Aaron>dir\n```"), "dir");
+  assert.equal(commandIn("```powershell\nPS C:\\Users\\Aaron>Get-Date\n```"), "Get-Date");
+});
+
+test("leaves a command that only starts like a path alone", () => {
+  const exe = "C:\\Windows\\System32\\cmd.exe /c dir";
+  assert.equal(commandIn(`\`\`\`cmd\n${exe}\n\`\`\``), exe);
+});
+
+test("survives CRLF line endings", () => {
+  assert.equal(commandIn("Sure.\r\n\r\n```bash\r\ndate\r\n```\r\n"), "date");
+  assert.equal(commandIn("```cmd\r\ncd /d C:\\Users\r\ndir\r\n```"), "cd /d C:\\Users\ndir");
+});
+
+test("still ignores a block that is not a command", () => {
+  assert.equal(commandIn("```ini\n[section]\nkey=1\n```"), "");
 });
 
 /* ------------------------------------------------------------------ */
@@ -283,6 +343,20 @@ await testAsync("keeps a multi-line block in one shell, so cd sticks", async () 
   const chat = fakeChat(["```bash\ncd /tmp\npwd\n```", "You are in /tmp."]);
   await new Agent(chat, CWD).run("where am I");
   assert.equal(chat.sent[1], "/tmp");
+});
+
+await testAsync("runs a block the model fenced for Windows instead of skipping it", async () => {
+  const chat = fakeChat(["```cmd\necho windows-style\n```", "Done."]);
+  const answer = await new Agent(chat, CWD).run("say it");
+  assert.equal(chat.sent.length, 2, "the block must reach the shell, not the prose");
+  assert.match(chat.sent[1], /windows-style/);
+  assert.equal(answer, "Done.");
+});
+
+await testAsync("runs a command in a shell named by the caller", async () => {
+  const result = await runShell("echo explicit-shell", CWD, resolveShell());
+  assert.equal(result.exitCode, 0);
+  assert.match(result.stdout, /explicit-shell/);
 });
 
 await testAsync("runs the command in the working directory", async () => {

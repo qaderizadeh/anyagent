@@ -19,7 +19,7 @@ import { createInterface } from "node:readline/promises";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { Agent, shellName } from "./agent.js";
+import { Agent, resolveShell, shellName } from "./agent.js";
 import { Browser, modes, type ChatSession } from "./browser.js";
 
 const dim = (text: string): string => (process.stdout.isTTY ? `\x1b[2m${text}\x1b[0m` : text);
@@ -44,7 +44,7 @@ Env:
   ANYAGENT_HEADLESS          "0" to show the browser window (default: hidden)
   ANYAGENT_BROWSER_PATH      pick a browser by hand (default: any Chrome, Edge or Chromium found)
   ANYAGENT_PACE_MS           pause before each prompt (default: 300)
-  ANYAGENT_SHELL             shell the commands run in (default: bash, cmd.exe on Windows)
+  ANYAGENT_SHELL             shell the commands run in (default: a real bash, cmd.exe on Windows)
   DEEPSEEK_THINKING_ENABLED  deep thinking (default: on)
   DEEPSEEK_SEARCH_ENABLED    web search (default: off)
   DEEPSEEK_MAX_ITERATIONS    loop limit (default: 50)
@@ -192,7 +192,8 @@ async function run(args: Args, browser: Browser, cwd: string): Promise<void> {
   console.log(`${dim("Session:  ")} ${agent.id || "(new chat)"}`);
   console.log(`${dim("Thinking: ")} ${thinking ? "enabled" : "disabled"}`);
   console.log(`${dim("Search:   ")} ${search ? "enabled" : "disabled"}`);
-  console.log(`${dim("Shell:    ")} ${shellName()}`);
+  // Print where it came from: on Windows the wrong bash silently runs nothing.
+  console.log(`${dim("Shell:    ")} ${shellName()} (${resolveShell()})`);
   console.log(`${dim("Directory:")} ${cwd}`);
   console.log();
   console.log(dim(`WARNING: this agent runs ${shellName()} commands and can modify files.`));

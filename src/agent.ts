@@ -39,14 +39,14 @@ const IS_WINDOWS = process.platform === "win32";
 const OS_NAME = IS_WINDOWS ? "Windows" : process.platform === "darwin" ? "macOS" : "Linux";
 
 /**
- * The shell commands run in: bash where it exists, the Windows command
- * interpreter otherwise. Set ANYAGENT_SHELL to a path or a name to override.
+ * bash.exe under System32 - or the WindowsApps alias folder - is not a shell at
+ * all, it is the WSL launcher. Running a command through it either fails, or
+ * hands it to a Linux box that cannot see the Windows working directory. Both
+ * look exactly like "the commands never run". A real Git Bash, MSYS2 or Cygwin
+ * bash lives somewhere else, and that one works.
  */
-export function resolveShell(): string {
-  const configured = (process.env["ANYAGENT_SHELL"] ?? "").trim();
-  if (configured !== "") return configured;
-  if (IS_WINDOWS) return onPath("bash.exe") ?? process.env["COMSPEC"] ?? "cmd.exe";
-  return "/bin/bash";
+export function isWslStub(bashPath: string): boolean {
+  return /\\system32\\|\\syswow64\\|\\windowsapps\\/.test(bashPath.toLowerCase().replace(/\//g, "\\"));
 }
 
 function onPath(file: string): string | undefined {
@@ -54,6 +54,47 @@ function onPath(file: string): string | undefined {
     if (dir !== "" && existsSync(path.join(dir, file))) return path.join(dir, file);
   }
   return undefined;
+}
+
+/** A Windows bash that runs commands in the user's own filesystem, not in WSL. */
+function realBash(): string | undefined {
+  const roots = [process.env["ProgramFiles"], process.env["ProgramFiles(x86)"], process.env["LOCALAPPDATA"]]
+    .filter((dir): dir is string => Boolean(dir));
+  const candidates = [
+    ...roots.flatMap((dir) => [
+      path.join(dir, "Git", "bin", "bash.exe"),
+      path.join(dir, "Programs", "Git", "bin", "bash.exe"),
+      path.join(dir, "Git", "usr", "bin", "bash.exe"),
+    ]),
+    "C:\\msys64\\usr\\bin\\bash.exe",
+    "C:\\cygwin64\\bin\\bash.exe",
+    "C:\\cygwin\\bin\\bash.exe",
+  ];
+  for (const candidate of candidates) if (existsSync(candidate)) return candidate;
+
+  const found = onPath("bash.exe");
+  return found !== undefined && !isWslStub(found) ? found : undefined;
+}
+
+function cmdShell(): string {
+  return process.env["COMSPEC"] || "cmd.exe";
+}
+
+function powershell(): string {
+  const installed = [onPath("pwsh.exe"), onPath("powershell.exe")];
+  for (const candidate of installed) if (candidate !== undefined) return candidate;
+  return path.join(process.env["SystemRoot"] ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+}
+
+/**
+ * The shell commands run in: a real bash where there is one, the Windows command
+ * interpreter otherwise. Set ANYAGENT_SHELL to a path or a name to override.
+ */
+export function resolveShell(): string {
+  const configured = (process.env["ANYAGENT_SHELL"] ?? "").trim();
+  if (configured !== "") return configured;
+  if (IS_WINDOWS) return realBash() ?? cmdShell();
+  return "/bin/bash";
 }
 
 /** The shell's short name, so the model writes commands that actually run. */
@@ -91,17 +132,47 @@ const FENCE = /^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+#.-]*)\s*$/;
 
 type Block = { info: string; body: string; raw: string };
 
-/** Fence tags worth running. Anything else is text the model is showing us. */
-function isShell(info: string): boolean {
-  return info === "" || /^(sh|bash|zsh|shell|dash|ksh|console|posix|sh-script|bash-script)$/.test(info);
+/**
+ * Fence tags that hold a command. A model on Windows writes `cmd` or
+ * `powershell` blocks whatever the setup asked for, and treating those as prose
+ * is a second way for "it never runs anything" to happen. Anything not listed
+ * here is text the model is showing us.
+ */
+const COMMAND_TAG =
+  /^(sh|bash|zsh|shell|dash|ksh|posix|sh-script|bash-script|console|cmd|bat|batch|dos|cmd-script|bat-script|powershell|pwsh|ps|ps1|powershell-script|ps-script)$/;
+
+function isCommandTag(info: string): boolean {
+  return info === "" || COMMAND_TAG.test(info);
 }
 
-/** A block copied out of a terminal still has its prompt on it: drop the "$ ". */
+/**
+ * A block may name a Windows shell instead of the one the setup named. Run it in
+ * the shell it asks for rather than ignore it. `undefined` means the default.
+ */
+export function shellFor(info: string, onWindows: boolean = IS_WINDOWS): string | undefined {
+  if (!onWindows) return undefined;
+  if (/^(cmd|bat|batch|dos)/.test(info)) return cmdShell();
+  if (/^(powershell|pwsh|ps)/.test(info)) return powershell();
+  return undefined;
+}
+
+/**
+ * A block copied out of a terminal still has its prompt on it. Drop the "$ " of
+ * a Unix prompt, or the "C:\Users\me>" / "PS C:\Users\me>" of a Windows one -
+ * neither is part of the command.
+ */
+const PROMPTS = [/^\s*\$\s+/, /^\s*(?:PS\s+)?[A-Za-z]:\\[^>]*>\s*/];
+
 function stripPrompt(body: string): string {
   const lines = body.split("\n");
   const first = lines.find((line) => line.trim() !== "");
-  if (first === undefined || !/^\s*\$\s+\S/.test(first)) return body;
-  return lines.map((line) => line.replace(/^\s*\$\s+/, "")).join("\n");
+  if (first === undefined) return body;
+  for (const prompt of PROMPTS) {
+    if (!prompt.test(first)) continue;
+    if (!/\S/.test(first.replace(prompt, ""))) return body; // a bare prompt, not a command
+    return lines.map((line) => line.replace(prompt, "")).join("\n");
+  }
+  return body;
 }
 
 /** Tidy the prose: no runs of blank lines where a command used to be. */
@@ -115,7 +186,9 @@ function tidy(text: string): string {
  * something, and that is worth seeing.
  */
 function split(reply: string): { blocks: Block[]; text: string } {
-  const lines = reply.split("\n");
+  // Anything that came off Windows may carry \r\n, and a stray \r on the end of
+  // a command makes the shell fail on a name that looks correct.
+  const lines = reply.replace(/\r\n?/g, "\n").split("\n");
   const blocks: Block[] = [];
   const kept: string[] = [];
   let open: string | null = null;
@@ -126,7 +199,7 @@ function split(reply: string): { blocks: Block[]; text: string } {
   const close = (end: number): void => {
     const block: Block = { info, body: body.join("\n"), raw: lines.slice(start, end + 1).join("\n") };
     blocks.push(block);
-    if (!isShell(block.info)) kept.push(block.raw);
+    if (!isCommandTag(block.info)) kept.push(block.raw);
     open = null;
   };
 
@@ -156,10 +229,23 @@ function split(reply: string): { blocks: Block[]; text: string } {
   return { blocks, text: tidy(kept.join("\n")) };
 }
 
+export type Command = {
+  /** The command to run, or "" when the reply holds none. */
+  command: string;
+  /** The shell it asked for, when it named one. */
+  shell?: string;
+};
+
+/** The one command to run this turn, and the shell it wants. */
+export function commandStep(reply: string): Command {
+  const block = split(reply).blocks.find((item) => isCommandTag(item.info));
+  if (block === undefined) return { command: "" };
+  return { command: stripPrompt(block.body).trim(), shell: shellFor(block.info) };
+}
+
 /** The one command to run this turn, or "" when the task is over. */
 export function commandIn(reply: string): string {
-  const block = split(reply).blocks.find((item) => isShell(item.info));
-  return block === undefined ? "" : stripPrompt(block.body).trim();
+  return commandStep(reply).command;
 }
 
 /** What the model said while still working, with the commands taken out. */
@@ -190,13 +276,13 @@ export function paste(result: ShellResult): string {
 }
 
 /** Run one shell command and always resolve with its exit code and output. */
-export function runShell(command: string, cwd: string): Promise<ShellResult> {
+export function runShell(command: string, cwd: string, shell: string = resolveShell()): Promise<ShellResult> {
   return new Promise((resolve) => {
     exec(
       command,
       {
         cwd,
-        shell: resolveShell(),
+        shell,
         timeout: SHELL_TIMEOUT_MS,
         killSignal: "SIGKILL",
         maxBuffer: 16 * 1024 * 1024,
@@ -281,12 +367,12 @@ export class Agent {
 
       // No command means the task is over - finished, or blocked and asking
       // for something only a person can do. The whole reply is the answer.
-      const command = commandIn(raw);
-      if (command === "") return raw;
+      const step = commandStep(raw);
+      if (step.command === "") return raw;
 
       events.onReply?.(proseOf(raw));
-      events.onCommand?.(command);
-      const result = await runShell(command, this.cwd);
+      events.onCommand?.(step.command);
+      const result = await runShell(step.command, this.cwd, step.shell);
       events.onResult?.(result);
       prompt = paste(result);
     }

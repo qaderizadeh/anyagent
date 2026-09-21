@@ -70,6 +70,35 @@ Three things worth knowing about what gets sent:
   directory, so `cd` does not carry over — the model is told that, and chains
   with `&&` when it matters.
 
+## On Windows
+
+Commands run in the shell the setup names, and AnyAgent picks one that can
+actually do the job:
+
+1. `ANYAGENT_SHELL`, if you set it.
+2. A **real** bash — Git Bash, MSYS2 or Cygwin, looked for in their usual
+   install locations and on `PATH`.
+3. Otherwise `cmd.exe`.
+
+`C:\Windows\System32\bash.exe` is deliberately **never** used. That file is not
+a shell, it is the WSL launcher: a command sent to it either fails or runs
+inside a Linux box that cannot see the Windows working directory. Both look like
+the agent never runs anything at all.
+
+Windows-flavoured fences count as commands. The model may answer with `cmd`,
+`bat` or `powershell` even when the setup said bash; those run in the shell they
+name rather than being passed over as prose — a block that gets ignored is
+indistinguishable from a command that was never executed.
+
+A `C:\Users\me>` or `PS C:\Users\me>` prompt that the model copies into a block
+is stripped, and `\r\n` line endings are tolerated, so the command that reaches
+the shell is the command that was written. The banner prints which shell was
+chosen, path and all, so the choice is never a guess:
+
+```
+Shell:     bash (C:\Program Files\Git\bin\bash.exe)
+```
+
 ## How it reaches DeepSeek
 
 Not over the API. AnyAgent opens a real Chromium, pastes the prompt into the
@@ -151,7 +180,7 @@ session alive, so the model sees what failed and can try something else.
 | `ANYAGENT_BROWSER_PATH` | — | use a specific browser instead of the one found |
 | `ANYAGENT_PROFILE_DIR` | `~/.anyagent/browser` | where the browser profile lives |
 | `ANYAGENT_PACE_MS` | `300` | pause before each prompt |
-| `ANYAGENT_SHELL` | `bash`, `cmd.exe` on Windows | shell the commands run in |
+| `ANYAGENT_SHELL` | a real bash, else `cmd.exe` on Windows | shell the commands run in (must take `-c`, or be `cmd.exe`) |
 | `DEEPSEEK_THINKING_ENABLED` | on | deep thinking, per message |
 | `DEEPSEEK_SEARCH_ENABLED` | off | web search, per message |
 | `DEEPSEEK_MAX_ITERATIONS` | `50` | loop limit |
