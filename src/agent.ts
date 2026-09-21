@@ -128,21 +128,53 @@ export type ShellResult = {
 /* the command                                                         */
 /* ------------------------------------------------------------------ */
 
-const FENCE = /^\s*(`{3,}|~{3,})\s*([A-Za-z0-9_+#.-]*)\s*$/;
+/** A fence line, and whatever tag follows it. `{.cmd}` and `cmd (Windows)` count. */
+const FENCE = /^\s*(`{3,}|~{3,})\s*(.*?)\s*$/;
 
 type Block = { info: string; body: string; raw: string };
 
 /**
- * Fence tags that hold a command. A model on Windows writes `cmd` or
- * `powershell` blocks whatever the setup asked for, and treating those as prose
- * is a second way for "it never runs anything" to happen. Anything not listed
- * here is text the model is showing us.
+ * Tags that mean "run this". A model on Windows writes `cmd` or `powershell`
+ * blocks whatever the setup asked for, and ignoring one is indistinguishable
+ * from never running anything - so match the name rather than the exact string:
+ * `cmd`, `CMD`, `cmd.exe`, `{.cmd}`, `cmd-script` are all the same shell.
+ * Anything not named here is text the model is showing us.
  */
-const COMMAND_TAG =
-  /^(sh|bash|zsh|shell|dash|ksh|posix|sh-script|bash-script|console|cmd|bat|batch|dos|cmd-script|bat-script|powershell|pwsh|ps|ps1|powershell-script|ps-script)$/;
+const KNOWN_SHELLS = new Set([
+  // a Unix shell, by any of its names
+  "sh", "bash", "zsh", "fish", "dash", "ash", "ksh", "mksh", "csh", "tcsh", "posix", "shell", "console",
+  // and Windows
+  "cmd", "bat", "batch", "dos", "win", "windows", "command", "commands", "cmdline",
+  "powershell", "pwsh", "ps", "ps1",
+]);
 
-function isCommandTag(info: string): boolean {
-  return info === "" || COMMAND_TAG.test(info);
+const CMD_TAGS = new Set(["cmd", "bat", "batch", "dos", "win", "windows", "command", "commands", "cmdline"]);
+const PS_TAGS = new Set(["powershell", "pwsh", "ps", "ps1"]);
+
+/** One tag word without its decoration: ".cmd" -> cmd, "cmd.exe" -> cmd. */
+function bare(word: string): string {
+  return word
+    .replace(/^[#.]+/, "")
+    .replace(/\.exe$/, "")
+    .replace(/[.]+$/, "")
+    .replace(/-(script|session|prompt|file|syntax|shell)$/, "");
+}
+
+/** The words of a tag, decoration off: "cmd.exe" -> [cmd], "{.cmd}" -> [cmd]. */
+function tagWords(info: string): string[] {
+  return info
+    .toLowerCase()
+    .replace(/[^a-z0-9#.-]+/g, " ")
+    .split(" ")
+    .map(bare)
+    .filter((word) => word !== "");
+}
+
+/** The shell a block names, or null when the block is text the model is showing us. */
+function shellTag(info: string): string | null {
+  if (info.trim() === "") return ""; // a bare fence is still a command
+  for (const word of tagWords(info)) if (KNOWN_SHELLS.has(word)) return word;
+  return null;
 }
 
 /**
@@ -151,8 +183,9 @@ function isCommandTag(info: string): boolean {
  */
 export function shellFor(info: string, onWindows: boolean = IS_WINDOWS): string | undefined {
   if (!onWindows) return undefined;
-  if (/^(cmd|bat|batch|dos)/.test(info)) return cmdShell();
-  if (/^(powershell|pwsh|ps)/.test(info)) return powershell();
+  const words = tagWords(info);
+  if (words.some((word) => PS_TAGS.has(word))) return powershell();
+  if (words.some((word) => CMD_TAGS.has(word))) return cmdShell();
   return undefined;
 }
 
@@ -199,7 +232,7 @@ function split(reply: string): { blocks: Block[]; text: string } {
   const close = (end: number): void => {
     const block: Block = { info, body: body.join("\n"), raw: lines.slice(start, end + 1).join("\n") };
     blocks.push(block);
-    if (!isCommandTag(block.info)) kept.push(block.raw);
+    if (shellTag(block.info) === null) kept.push(block.raw);
     open = null;
   };
 
@@ -238,9 +271,23 @@ export type Command = {
 
 /** The one command to run this turn, and the shell it wants. */
 export function commandStep(reply: string): Command {
-  const block = split(reply).blocks.find((item) => isCommandTag(item.info));
-  if (block === undefined) return { command: "" };
-  return { command: stripPrompt(block.body).trim(), shell: shellFor(block.info) };
+  for (const block of split(reply).blocks) {
+    const tag = shellTag(block.info);
+    if (tag === null) continue;
+    return { command: stripPrompt(block.body).trim(), shell: shellFor(tag) };
+  }
+  return { command: "" };
+}
+
+/**
+ * Blocks a reply showed us instead of asking us to run them. Worth naming when
+ * the reply also ends the task: a block that was passed over and a command that
+ * was never executed look the same from the outside.
+ */
+export function unrunTags(reply: string): string[] {
+  return split(reply)
+    .blocks.filter((block) => shellTag(block.info) === null)
+    .map((block) => block.info);
 }
 
 /** The one command to run this turn, or "" when the task is over. */
@@ -314,6 +361,8 @@ export type AgentEvents = {
   /** The command we are about to run. */
   onCommand?: (command: string) => void;
   onResult?: (result: ShellResult) => void;
+  /** Blocks in the closing reply that were shown, not run - so nothing ran. */
+  onUnrun?: (tags: string[]) => void;
 };
 
 export class Agent {
@@ -368,7 +417,11 @@ export class Agent {
       // No command means the task is over - finished, or blocked and asking
       // for something only a person can do. The whole reply is the answer.
       const step = commandStep(raw);
-      if (step.command === "") return raw;
+      if (step.command === "") {
+        const unrun = unrunTags(raw);
+        if (unrun.length > 0) events.onUnrun?.(unrun);
+        return raw;
+      }
 
       events.onReply?.(proseOf(raw));
       events.onCommand?.(step.command);

@@ -14,7 +14,7 @@ import * as path from "node:path";
 process.env.DEEPSEEK_MAX_ITERATIONS = "6";
 process.env.DEEPSEEK_SHELL_TIMEOUT_MS = "1500";
 
-const { Agent, commandIn, isWslStub, paste, proseOf, resolveShell, runShell, setup, shellFor, shellName } =
+const { Agent, commandIn, isWslStub, paste, proseOf, resolveShell, runShell, setup, shellFor, shellName, unrunTags } =
   await import("./dist/agent.js");
 
 let passed = 0;
@@ -139,11 +139,34 @@ test("takes the command out of a block fenced for Windows", () => {
   }
 });
 
+// The tag a model writes varies with no warning, and every variant it writes
+// that we treat as prose is a command that never runs.
+test("reads a Windows tag however it is written", () => {
+  const tags = [
+    "CMD", "cmd.exe", "cmd-script", "{.cmd}", "cmd (Windows)", " cmd ",
+    "win", "windows", "command", "command-prompt", "powershell.exe", "pwsh.exe",
+    "PowerShell", "windows powershell",
+  ];
+  for (const tag of tags) assert.equal(commandIn(`\`\`\`${tag}\ndir\n\`\`\``), "dir", tag);
+});
+
 test("runs a Windows block in the shell it names", () => {
   assert.match(shellFor("cmd", true), /cmd(\.exe)?$/i);
   assert.match(shellFor("bat", true), /cmd(\.exe)?$/i);
+  assert.match(shellFor("cmd.exe", true), /cmd(\.exe)?$/i);
+  assert.match(shellFor("{.cmd}", true), /cmd(\.exe)?$/i);
   assert.match(shellFor("powershell", true), /powershell\.exe$/i);
   assert.match(shellFor("ps1", true), /powershell\.exe$/i);
+  assert.match(shellFor("powershell.exe", true), /powershell\.exe$/i);
+  // A PowerShell block is PowerShell even when the tag mentions Windows.
+  assert.match(shellFor("windows powershell", true), /powershell\.exe$/i);
+});
+
+test("names the blocks it did not run", () => {
+  assert.deepEqual(unrunTags("Here is the JSON:\n\n```json\n{}\n```"), ["json"]);
+  assert.deepEqual(unrunTags("```text\nshown\n```"), ["text"]);
+  assert.deepEqual(unrunTags("```cmd\ndir\n```"), [], "a command is not a skipped block");
+  assert.deepEqual(unrunTags("Just prose."), []);
 });
 
 test("leaves a bash block to the default shell on Windows", () => {
@@ -185,7 +208,9 @@ test("survives CRLF line endings", () => {
 });
 
 test("still ignores a block that is not a command", () => {
-  assert.equal(commandIn("```ini\n[section]\nkey=1\n```"), "");
+  for (const tag of ["ini", "json", "text", "python", "yaml", "output", "diff"]) {
+    assert.equal(commandIn(`\`\`\`${tag}\n[section]\nkey=1\n\`\`\``), "", tag);
+  }
 });
 
 /* ------------------------------------------------------------------ */
@@ -346,11 +371,27 @@ await testAsync("keeps a multi-line block in one shell, so cd sticks", async () 
 });
 
 await testAsync("runs a block the model fenced for Windows instead of skipping it", async () => {
-  const chat = fakeChat(["```cmd\necho windows-style\n```", "Done."]);
-  const answer = await new Agent(chat, CWD).run("say it");
-  assert.equal(chat.sent.length, 2, "the block must reach the shell, not the prose");
-  assert.match(chat.sent[1], /windows-style/);
-  assert.equal(answer, "Done.");
+  for (const tag of ["cmd", "cmd.exe", "powershell", "windows powershell"]) {
+    const chat = fakeChat([`\`\`\`${tag}\necho windows-style\n\`\`\``, "Done."]);
+    const answer = await new Agent(chat, CWD).run("say it");
+    assert.equal(chat.sent.length, 2, `${tag}: the block must reach the shell, not the prose`);
+    assert.match(chat.sent[1], /windows-style/, tag);
+    assert.equal(answer, "Done.", tag);
+  }
+});
+
+await testAsync("says which blocks it did not run when the reply ends the task", async () => {
+  const chat = fakeChat(['Done - the file looks like:\n\n```json\n{"a": 1}\n```']);
+  const seen = [];
+  await new Agent(chat, CWD).run("show me the file", { onUnrun: (tags) => seen.push(...tags) });
+  assert.deepEqual(seen, ["json"]);
+});
+
+await testAsync("stays quiet when the closing reply holds no block", async () => {
+  const chat = fakeChat(["All done."]);
+  const seen = [];
+  await new Agent(chat, CWD).run("do it", { onUnrun: (tags) => seen.push(...tags) });
+  assert.deepEqual(seen, []);
 });
 
 await testAsync("runs a command in a shell named by the caller", async () => {

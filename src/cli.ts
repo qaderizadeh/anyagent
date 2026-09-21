@@ -218,6 +218,10 @@ async function run(args: Args, browser: Browser, cwd: string): Promise<void> {
           const reason = result.stderr.split("\n").find((line) => line.trim() !== "");
           if (result.exitCode !== 0 && reason) console.log(dim(`     ${oneLine(reason, 140)}`));
         },
+        // Never let this be a mystery: say which block was text, not a command.
+        onUnrun: (tags) => {
+          for (const tag of tags) console.log(dim(`  ! the \`\`\`${oneLine(tag, 40)} block was not run (not a command)`));
+        },
       });
     } finally {
       busy = false;

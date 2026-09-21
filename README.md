@@ -90,6 +90,16 @@ Windows-flavoured fences count as commands. The model may answer with `cmd`,
 name rather than being passed over as prose — a block that gets ignored is
 indistinguishable from a command that was never executed.
 
+The tag is read however it is written — `CMD`, `cmd.exe`, `{.cmd}`,
+`cmd-script`, `cmd (Windows)`, `windows powershell` all land on the right shell.
+And a block that is *not* a command is never passed over silently: if the reply
+that ends the task still holds one, the CLI names it:
+
+```
+  · Here is the config.
+  ! the ```json block was not run (not a command)
+```
+
 A `C:\Users\me>` or `PS C:\Users\me>` prompt that the model copies into a block
 is stripped, and `\r\n` line endings are tolerated, so the command that reaches
 the shell is the command that was written. The banner prints which shell was

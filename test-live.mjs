@@ -405,6 +405,35 @@ await test("the model was given the chance to react to it", () => {
 });
 
 /* ------------------------------------------------------------------ */
+console.log("\n== a block fenced for Windows runs anyway ==\n");
+/* ------------------------------------------------------------------ */
+
+// A model on Windows fences the command `cmd` whatever the setup asked for.
+// Passing that over as prose is a command that never runs, which looks from the
+// outside exactly like an agent that does not execute anything.
+prompts.length = 0;
+replies = [
+  "Running it the Windows way.\n\n```cmd\necho from-cmd-block > cmd-marker.txt && cat cmd-marker.txt\n```",
+  'Done - it printed from-cmd-block.\n\n```json\n{"ran": true}\n```',
+];
+
+const winFenced = await runCli(["--cwd", project, "run it the windows way"]);
+
+await test("the command in the cmd block reached the shell", () => {
+  assert.equal(prompts.length, 2, `prompts: ${JSON.stringify(prompts)}`);
+  assert.match(prompts[1], /from-cmd-block/);
+});
+
+await test("the CLI showed it running", () => {
+  assert.match(winFenced.out, /\$ echo from-cmd-block/);
+  assert.ok(fs.existsSync(path.join(project, "cmd-marker.txt")), "the command really ran");
+});
+
+await test("it names the block it did not run, instead of staying silent", () => {
+  assert.match(winFenced.out, /the ```json block was not run/);
+});
+
+/* ------------------------------------------------------------------ */
 console.log("\n== the model shows something without asking for a command ==\n");
 /* ------------------------------------------------------------------ */
 
