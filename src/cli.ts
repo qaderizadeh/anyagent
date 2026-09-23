@@ -1,81 +1,74 @@
 #!/usr/bin/env node
 /**
- * AnyAgent - a small CLI agent on chat.deepseek.com.
+ * AnyAgent — a small CLI agent that talks straight to chat.deepseek.com.
  *
- *   anyagent                  pick a session (or start one) and chat
+ *   anyagent                  pick a chat (or start one) and work in it
  *   anyagent "task"           run one task and exit
- *   anyagent --new            force a brand-new session
- *   anyagent --session ID     continue a specific session
- *   anyagent --cwd DIR        working directory for the commands
+ *   anyagent --new            force a brand-new chat
+ *   anyagent --session ID     continue a specific chat
+ *   anyagent --cwd DIR        where the commands run
  *
- * Everything runs through a real Chromium, hidden by default. The sign-in is
- * the captured authorization + cookie from DEEPSEEK_SESSION_JSON, put into the
- * browser before the page loads; with no such file the browser profile is used
- * and you sign in once in a visible window. Sessions and messages live on
- * chat.deepseek.com - nothing is stored locally.
+ * Chats live on chat.deepseek.com. Nothing is kept on disk except the captured
+ * credentials in DEEPSEEK_SESSION_JSON.
  */
 
 import { createInterface } from "node:readline/promises";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { Agent, resolveShell, shellName } from "./agent.js";
-import { Browser, modes, type ChatSession } from "./browser.js";
+import { Agent, searchEnabled, shellName, thinkingEnabled } from "./agent.js";
+import {
+  BizError,
+  createSession,
+  history,
+  listSessions,
+  loadSession,
+  resolveWasmPath,
+  verifySession,
+  type ChatSession,
+  type Session,
+} from "./deepseek.js";
 
 const dim = (text: string): string => (process.stdout.isTTY ? `\x1b[2m${text}\x1b[0m` : text);
 const bold = (text: string): string => (process.stdout.isTTY ? `\x1b[1m${text}\x1b[0m` : text);
 
-/**
- * The version, read from package.json beside the build.
- *
- * It is printed in the banner so a report of "it still does X" can be tied to
- * the build that did it - an unpulled checkout and a stale dist look exactly
- * like a fix that did not work.
- */
-const VERSION = ((): string => {
+/** Printed in the banner so it is never a guess which build is running. */
+const VERSION = version();
+
+function version(): string {
   try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-    const version = (parsed as { version?: unknown }).version;
-    return typeof version === "string" ? version : "";
+    const file = new URL("../package.json", import.meta.url);
+    return (JSON.parse(fs.readFileSync(file, "utf8")) as { version?: string }).version ?? "?";
   } catch {
-    return "";
+    return "?";
   }
-})();
+}
 
 const HELP = `Commands:
   /help       show this
-  /sessions   list DeepSeek sessions and switch
-  /new        start a new DeepSeek session
+  /sessions   list the chats on chat.deepseek.com and switch
+  /new        start a new chat
   /exit       quit (also Ctrl+C, Ctrl+D)
 
 Usage:
-  anyagent                  pick a session and chat
+  anyagent                  pick a chat and work in it
   anyagent "task"           run one task and exit
-  anyagent --new            new session
-  anyagent --session ID     continue a session
+  anyagent --new            new chat
+  anyagent --session ID     continue a chat
   anyagent --cwd DIR        working directory
 
 Env:
-  DEEPSEEK_SESSION_JSON      captured authorization + cookie (or DEEPSEEK_SESSION_PATH)
-  ANYAGENT_PROFILE_DIR       browser profile, used when there is no credentials file
-  ANYAGENT_HEADLESS          "0" to show the browser window (default: hidden)
-  ANYAGENT_BROWSER           edge | chrome | chromium | bundled (default: Edge, then Chrome, then Chromium)
-  ANYAGENT_BROWSER_PATH      pick a browser by hand, whatever its name
-  ANYAGENT_PACE_MS           pause before each prompt (default: 300)
-  ANYAGENT_DEBUG             1 to keep each turn's raw response in the profile dir
-  ANYAGENT_SHELL             shell the commands run in (default: a real bash, cmd.exe on Windows)
-  DEEPSEEK_THINKING_ENABLED  deep thinking, never shown to you (default: on; 0 = off)
+  DEEPSEEK_SESSION_JSON / DEEPSEEK_SESSION_PATH   captured credentials
+  DEEPSEEK_MODEL_TYPE        backend model (default: backend default)
+  DEEPSEEK_THINKING_ENABLED  deep thinking (default: on)
   DEEPSEEK_SEARCH_ENABLED    web search (default: off)
   DEEPSEEK_MAX_ITERATIONS    loop limit (default: 50)
-  DEEPSEEK_SHELL_TIMEOUT_MS  command timeout (default: 120000)`;
+  DEEPSEEK_SHELL_TIMEOUT_MS  command timeout (default: 120000)
+  ANYAGENT_SHELL             shell to run commands in (default: cmd on
+                             Windows, /bin/sh elsewhere)
+  ANYAGENT_HOST              backend to talk to (tests only)`;
 
-type Args = {
-  cwd: string;
-  session?: string;
-  fresh: boolean;
-  task?: string;
-  help: boolean;
-};
+type Args = { cwd: string; session?: string; fresh: boolean; task?: string; help: boolean };
 
 let rl: ReturnType<typeof createInterface> | undefined;
 let busy = false;
@@ -83,9 +76,8 @@ let busy = false;
 /**
  * Line queue around readline.
  *
- * readline drops lines that arrive while no question is pending (which is
- * exactly what happens when input is piped), so buffer them here instead.
- * `null` means end of input.
+ * readline drops lines that arrive while no question is pending (which is what
+ * happens when input is piped), so buffer them here instead. `null` is end of input.
  */
 const queued: Array<string | null> = [];
 const pending: Array<(line: string | null) => void> = [];
@@ -140,27 +132,35 @@ function parseArgs(argv: string[]): Args {
   return args;
 }
 
-function when(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds <= 0) return "                 ";
-  return new Date(seconds * 1000).toISOString().slice(0, 16).replace("T", " ");
-}
-
-function oneLine(text: string, max = 100): string {
+const oneLine = (text: string, max = 100): string => {
   const flat = text.replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max)}...` : flat;
-}
+};
+
+const when = (seconds: number): string =>
+  Number.isFinite(seconds) && seconds > 0
+    ? new Date(seconds * 1000).toISOString().slice(0, 16).replace("T", " ")
+    : "                 ";
 
 function printSessions(list: ChatSession[]): void {
-  console.log(dim("Sessions on chat.deepseek.com:"));
+  console.log(dim("Chats on chat.deepseek.com:"));
   list.forEach((item, index) => {
     console.log(`  [${index + 1}] ${when(item.updatedAt)}  ${oneLine(item.title, 70)}`);
   });
-  console.log("  [0] start a new session\n");
+  console.log("  [0] start a new chat\n");
 }
 
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+/** The newest message id in a chat — the parent for the next message. */
+async function tipOf(session: Session, chatId: string): Promise<number> {
+  const messages = await history(session, chatId).catch(() => []);
+  return messages.reduce((max, message) => Math.max(max, message.id), 0);
 }
+
+const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/** A DeepSeek rejection is worth its code - it says what to do about it. */
+const say = (error: unknown): string =>
+  error instanceof BizError ? `DeepSeek error (${error.code}): ${error.message}` : errorText(error);
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
@@ -174,50 +174,45 @@ async function main(): Promise<void> {
     throw new Error(`Working directory does not exist: ${cwd}`);
   }
 
-  const browser = await Browser.open((text) => console.log(dim(text)));
-  try {
-    await run(args, browser, cwd);
-  } finally {
-    await browser.close();
-  }
-}
+  const session = loadSession();
+  await verifySession(session);
 
-async function run(args: Args, browser: Browser, cwd: string): Promise<void> {
-  const agent = new Agent(browser, cwd);
-  const list = await browser.listSessions(10);
+  const wasmPath = resolveWasmPath();
+  const list = await listSessions(session);
+
+  let chatId: string;
+  let parentId = 0;
 
   if (args.session != null) {
-    await agent.openSession(args.session);
+    chatId = args.session;
+    parentId = await tipOf(session, chatId);
   } else if (args.fresh || args.task != null) {
-    await agent.newSession();
+    chatId = await createSession(session);
   } else {
     if (list.length > 0) printSessions(list);
-    const asked = await ask(list.length > 0 ? "Pick [0]: " : "Start a new session? [y]: ");
+    const asked = await ask(list.length > 0 ? "Pick [0]: " : "Start a new chat? [y]: ");
     if (asked === null) return;
     const choice = Number(asked.trim() === "" ? "0" : asked.trim());
     const picked =
-      Number.isInteger(choice) && choice >= 1 && choice <= list.length
-        ? list[choice - 1]!.id
-        : undefined;
-    if (picked === undefined) await agent.newSession();
-    else await agent.openSession(picked);
+      Number.isInteger(choice) && choice >= 1 && choice <= list.length ? list[choice - 1]!.id : undefined;
+    chatId = picked ?? (await createSession(session));
+    parentId = picked ? await tipOf(session, chatId) : 0;
   }
 
-  const { thinking, search } = modes();
-  console.log(bold("AnyAgent") + (VERSION === "" ? "" : dim(` ${VERSION}`)));
+  console.log(bold(`AnyAgent ${VERSION}`));
   console.log("────────────────────────────");
-  console.log(`${dim("Backend:  ")} chat.deepseek.com (${browser.mode})`);
-  console.log(`${dim("Login:    ")} ${browser.login}`);
-  console.log(`${dim("Session:  ")} ${agent.id || "(new chat)"}`);
-  console.log(`${dim("Thinking: ")} ${thinking ? "enabled" : "disabled"}`);
-  console.log(`${dim("Search:   ")} ${search ? "enabled" : "disabled"}`);
-  // Print where it came from: on Windows the wrong bash silently runs nothing.
-  console.log(`${dim("Shell:    ")} ${shellName()} (${resolveShell()})`);
+  console.log(`${dim("Backend:  ")} chat.deepseek.com (web session)`);
+  console.log(`${dim("Chat:     ")} ${chatId}`);
+  console.log(`${dim("Thinking: ")} ${thinkingEnabled() ? "enabled" : "disabled"}`);
+  console.log(`${dim("Search:   ")} ${searchEnabled() ? "enabled" : "disabled"}`);
+  console.log(`${dim("Shell:    ")} ${shellName()}`);
   console.log(`${dim("Directory:")} ${cwd}`);
   console.log();
   console.log(dim(`WARNING: this agent runs ${shellName()} commands and can modify files.`));
   console.log(dim("Only run it in a directory/environment you trust."));
   console.log();
+
+  const agent = new Agent(session, chatId, wasmPath, cwd, parentId || undefined);
 
   const runTask = async (task: string): Promise<void> => {
     const started = Date.now();
@@ -225,22 +220,17 @@ async function run(args: Args, browser: Browser, cwd: string): Promise<void> {
     let answer: string;
     try {
       answer = await agent.run(task, {
-        onReply: (prose) => {
-          for (const line of prose.split("\n")) {
-            if (line.trim() !== "") console.log(dim(`  · ${oneLine(line, 200)}`));
+        onComment: (text) => console.log(dim(`  · ${oneLine(text, 160)}`)),
+        onCommand: (command) => console.log(dim(`  -> $ ${oneLine(command, 160)}`)),
+        onResult: (result) => {
+          console.log(dim(`     ${result.code === 0 ? "ok" : `exit ${result.code}`}`));
+          // Say why it failed - otherwise a failure is just a number.
+          if (result.code !== 0) {
+            const reason = result.output.split("\n").find((line) => line.trim() !== "");
+            if (reason) console.log(dim(`     ${oneLine(reason, 140)}`));
           }
         },
-        onCommand: (command) => console.log(dim(`  -> $ ${oneLine(command, 140)}`)),
-        onResult: (result) => {
-          console.log(dim(`     ${result.exitCode === 0 ? "ok" : `exit ${result.exitCode}`}`));
-          // Show why it failed - a shell that never started is otherwise silent.
-          const reason = result.stderr.split("\n").find((line) => line.trim() !== "");
-          if (result.exitCode !== 0 && reason) console.log(dim(`     ${oneLine(reason, 140)}`));
-        },
-        // Never let this be a mystery: say which block was text, not a command.
-        onUnrun: (tags) => {
-          for (const tag of tags) console.log(dim(`  ! the \`\`\`${oneLine(tag, 40)} block was not run (not a command)`));
-        },
+        onNewSession: () => console.log(dim("  ! the previous chat was gone; started a new one")),
       });
     } finally {
       busy = false;
@@ -267,7 +257,7 @@ async function run(args: Args, browser: Browser, cwd: string): Promise<void> {
         await runTask(input);
       } catch (error) {
         console.log();
-        console.log(errorText(error));
+        console.log(say(error));
         console.log(dim("Try again, or /exit to quit."));
       }
       continue;
@@ -283,15 +273,15 @@ async function run(args: Args, browser: Browser, cwd: string): Promise<void> {
     }
 
     if (command === "new") {
-      await agent.newSession();
-      console.log(dim("Started a new DeepSeek session."));
+      agent.repoint(await createSession(session));
+      console.log(dim("Started a new chat."));
       continue;
     }
 
     if (command === "sessions") {
-      const fresh = await browser.listSessions();
+      const fresh = await listSessions(session);
       if (fresh.length === 0) {
-        console.log(dim("No sessions on the backend yet."));
+        console.log(dim("No chats on the backend yet."));
         continue;
       }
       printSessions(fresh);
@@ -299,7 +289,7 @@ async function run(args: Args, browser: Browser, cwd: string): Promise<void> {
       const choice = Number((asked ?? "0").trim());
       if (Number.isInteger(choice) && choice >= 1 && choice <= fresh.length) {
         const chosen = fresh[choice - 1]!;
-        await agent.openSession(chosen.id);
+        agent.repoint(chosen.id, (await tipOf(session, chosen.id)) || undefined);
         console.log(dim(`Continuing "${oneLine(chosen.title, 60)}".`));
       }
       continue;
@@ -318,7 +308,7 @@ main()
   })
   .catch((error: unknown) => {
     console.log();
-    console.log(errorText(error));
+    console.log(say(error));
     rl?.close();
     process.exit(1);
   });

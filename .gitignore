@@ -4,14 +4,11 @@ dist/
 .DS_Store
 .env
 
-# The captured DeepSeek session - never commit a real one.
+# The captured DeepSeek session — never commit a real one.
 DEEPSEEK_SESSION_JSON
 DEEPSEEK_SESSION_PATH
-
-# The browser profile, if it is pointed inside the project.
-# The default lives in ~/.anyagent/browser, well away from the repo.
-.anyagent/
 
 # Local test artifacts (not part of the project)
 /my-express-app/
 /screenshot-app/
+/browser-profile/

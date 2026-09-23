@@ -1,275 +1,136 @@
 # AnyAgent
 
-A small CLI agent that drives **chat.deepseek.com** in a real browser.
-
-It has a normal conversation. The model writes a command, AnyAgent runs it, and
-the output gets typed back — the same thing you would do by hand. There is no
-API key, no tool schema, and no "agent framework".
+A personal CLI agent that talks **straight to chat.deepseek.com over HTTPS** — no API key, no
+browser, no tool schema. The model is simply someone in a chat who tells you what to type; the
+agent types it, pastes the output back, and keeps going until the model stops asking for commands.
 
 ```
-> create a file called hello.txt containing Hello World
-
-  · Let me write that file.
-  -> $ printf 'Hello World' > hello.txt && wc -c < hello.txt
+> what time is it?
+  · Checking the clock.
+  -> $ date
      ok
 
-Created hello.txt with Hello World.
-(4.1s)
+It is 14:32 UTC on Tuesday.
+(3.1s)
 ```
 
-## Why a normal chat
-
-Earlier versions told the model it was "an agent with a shell tool" and made it
-answer with a strict JSON object every turn. That works, but it is a machine
-talking to a machine: a fixed schema, a fixed shape, every single message.
-
-This version is a person talking to DeepSeek. The model replies however it
-likes; when there is a command in it, AnyAgent runs that command and pastes the
-output back. A reply with no command means the task is over — finished, or
-blocked and asking for something only a person can do.
+Three source files, no runtime dependencies. `agent.ts` is the whole idea:
 
 ```
-task ─→ reply ─→ fenced command? ──no──→ done
-                       │yes
-                       ↓
-                  run it, paste the output back
+task -> model -> prose + maybe one ```sh block -> run it -> paste the output back -> ...
+                                                              -> no block means it is the answer
 ```
 
-The only structure asked for is a fenced block for the command. Everything else
-— the prose, the questions, the shape of the answer — is left to the model.
+---
 
-## What is sent, and what comes back
+## Requirements
 
-Everything lives on chat.deepseek.com. The CLI opens a chat, keeps it open, and
-nothing is stored on your machine except the browser profile.
+- Node.js 20 or newer
+- A chat.deepseek.com account, signed in **in a browser**
 
-```
-You:  I'm at a bash prompt on my Linux machine, in /home/me/app, and I'll paste
-      back whatever prints. Give me one command at a time in a ```bash block...
+## Setup
 
-      create a file called hello.txt containing Hello World
+The agent uses the session your browser already has, so copy it out once.
 
-It:   Let me write that file.
-      ```bash
-      printf 'Hello World' > hello.txt && wc -c < hello.txt
-      ```
-
-You:  11
-
-It:   Created `hello.txt` with Hello World.
-```
-
-Three things worth knowing about what gets sent:
-
-- **The setup is said once**, as the first message of a new chat. A person does
-  not re-introduce themselves before every question.
-- **The output is the only thing typed back.** No `$` echo, no exit code for a
-  success. A failure says so (`(exit code 2)`), because a person would mention
-  it. Very long output is marked where it was cut.
-- **One command at a time.** Each block runs in a fresh shell in the working
-  directory, so `cd` does not carry over — the model is told that, and chains
-  with `&&` when it matters.
-
-## On Windows
-
-Commands run in the shell the setup names, and AnyAgent picks one that can
-actually do the job:
-
-1. `ANYAGENT_SHELL`, if you set it.
-2. A **real** bash — Git Bash, MSYS2 or Cygwin, looked for in their usual
-   install locations and on `PATH`.
-3. Otherwise `cmd.exe`.
-
-`C:\Windows\System32\bash.exe` is deliberately **never** used. That file is not
-a shell, it is the WSL launcher: a command sent to it either fails or runs
-inside a Linux box that cannot see the Windows working directory. Both look like
-the agent never runs anything at all.
-
-Windows-flavoured fences count as commands. The model may answer with `cmd`,
-`bat` or `powershell` even when the setup said bash; those run in the shell they
-name rather than being passed over as prose — a block that gets ignored is
-indistinguishable from a command that was never executed.
-
-The tag is read however it is written — `CMD`, `cmd.exe`, `{.cmd}`,
-`cmd-script`, `cmd (Windows)`, `windows powershell` all land on the right shell.
-And a block that is *not* a command is never passed over silently: if the reply
-that ends the task still holds one, the CLI names it:
-
-```
-  · Here is the config.
-  ! the ```json block was not run (not a command)
-```
-
-A `C:\Users\me>` or `PS C:\Users\me>` prompt that the model copies into a block
-is stripped, and `\r\n` line endings are tolerated, so the command that reaches
-the shell is the command that was written. The banner prints which shell was
-chosen, path and all, so the choice is never a guess:
-
-```
-Shell:     bash (C:\Program Files\Git\bin\bash.exe)
-```
-
-## How it reaches DeepSeek
-
-Not over the API. AnyAgent opens a real Chromium, pastes the prompt into the
-real composer, presses Enter, and reads DeepSeek's own response off the wire.
-The request is the one the site makes itself, with its own fingerprint, its own
-proof of work and a human pace — not a script's.
-
-The window is **hidden** by default, and the sign-in is the `authorization` and
-`cookie` you already capture from your browser, put in before the page's
-scripts run. Nothing is typed; the prompt is pasted in one go.
-
-It drives a browser that is already on the machine, and on Windows that means
-**Edge first**, then Chrome, then Chromium — Edge ships with the system, so it
-is the browser that is meant to be there. `ANYAGENT_BROWSER` picks one by name
-when the machine has several and the choice matters, and
-`ANYAGENT_BROWSER_PATH` takes a path. Playwright's own bundled Chromium is the
-last resort.
-
-### How the answer is read back
-
-The reply is not taken from the response body alone. Three independent readings
-of the same turn are used, because any one of them can fail while the others are
-fine:
-
-1. **What the page shows** — the rendered message, with its code fences put
-   back. This is what a person reads, and it cannot drift out of step with the
-   site: if the answer is on screen, we have it.
-2. **What the chat stored** — the raw message, which is the whole answer rather
-   than whatever had rendered by then.
-3. **The response body** — its streamed chunks are parsed, and this is what says
-   the turn is *over*.
-
-All three have to agree about one thing: **the model's reasoning is not its
-answer.** A message on DeepSeek is a list of typed fragments — `THINK` for the
-thinking, `RESPONSE` for the reply — and the site names a fragment's type once,
-then streams the rest of that fragment as appends that name nothing at all:
-
-```text
-data: {"p":"response/fragments","o":"APPEND","v":[{"id":2,"type":"RESPONSE","content":"Sure. "}]}
-data: {"p":"response/fragments/-1/content","o":"APPEND","v":"Here you go."}
-```
-
-Both channels use that same append field, so **the channel is carried, never
-re-derived from the chunk in front of you** — and it begins as the reasoning, so
-anything that has not declared itself the answer is the thinking. A fragment type
-we do not recognise carries no text at all rather than being guessed to be the
-answer: losing the reply is visible and gets fixed, showing the thinking is
-neither.
-
-Getting this wrong shows you the model's private thoughts as its reply, and runs
-a fenced command found *inside* those thoughts as though the model had asked for
-it. That is not hypothetical — it is what this did before, so there is a test for
-each half of it, and both fail against the old parser.
-
-This matters because a chunk shape we do not recognise parses to an empty turn,
-and an empty turn is indistinguishable from a site that said nothing. Earlier
-versions read the response only, so a shape change on the site looked like
-silence rather than like a bug — see *When a turn gets no answer*.
-
-## Install
-
-```bash
-npm install
-```
-
-Then either:
-
-- **use the session you captured** — put it next to the project as
-  `DEEPSEEK_SESSION_JSON` (see below), or
-- **sign in once in a window** — `ANYAGENT_HEADLESS=0 npm start`, sign in, and
-  the browser profile remembers it. Later runs can be hidden again.
-
-`npx playwright install chromium` is only needed if the machine has no Chrome,
-Edge or Chromium already — AnyAgent uses the one you have.
-
-## The session file
-
-In the project folder, next to `package.json`:
-
-1. Open <https://chat.deepseek.com> and sign in.
-2. DevTools → **Network**. Click any request to `/api/v0/…`
+1. Open https://chat.deepseek.com and sign in.
+2. Open DevTools → **Network**, and click any request to `/api/v0/...`
    (`create_pow_challenge` is a good one).
-3. Under **Request Headers**, copy `authorization` and `cookie`.
-4. Write them into `DEEPSEEK_SESSION_JSON`:
+3. Under **Request Headers**, copy the values of `authorization` and `cookie`.
+4. Save them in a file called `DEEPSEEK_SESSION_JSON` next to the project:
 
 ```json
 {
-  "authorization": "Bearer eyJhbGciOi...",
-  "cookie": "ds_session_id=abc123...; smidV2=...; aws-waf-token=..."
+  "authorization": "Bearer <the authorization value>",
+  "cookie": "ds_session_id=<the cookie value>; ..."
 }
 ```
 
-`token` + `cookies` (a name→value map) works too. If the capture is rejected,
-AnyAgent says so up front and tells you to re-capture — the `aws-waf-token`
-cookie is usually the first to expire.
-
-## Use
+Then:
 
 ```bash
-npm start                              # chat in the current directory
-npm start -- "list the largest files"  # one task and exit
-npm start -- --cwd ~/project           # run somewhere else
-npm start -- --new                     # start a fresh DeepSeek chat
-npm start -- --session <id>            # continue a specific chat
+npm install
+npm start
 ```
 
-At startup you pick from the sessions already on your account, and `/sessions`
-switches between them mid-run. `npm start` compiles first, so there is no
-separate build step and no stale `dist/`.
+The file is in `.gitignore`. When the session expires the backend says so, and you copy the two
+headers again — that is the only maintenance this project needs.
 
-| Command | |
-|---|---|
-| `/help` | show the commands |
-| `/sessions` | list your DeepSeek chats and switch |
-| `/new` | start a new chat |
-| `/exit` | quit (also Ctrl+C, Ctrl+D) |
+## Usage
 
-While a task is running, Ctrl+C stops the command that is running and keeps the
-session alive, so the model sees what failed and can try something else.
+```bash
+anyagent                  # pick one of your chats (or start one) and work in it
+anyagent "task"           # run one task and exit
+anyagent --new            # force a brand-new chat
+anyagent --session ID     # continue a specific chat
+anyagent --cwd DIR        # where the commands run (default: here)
+```
 
-## Settings
+In the chat: `/help`, `/sessions` (lists the chats on chat.deepseek.com and switches),
+`/new`, `/exit`. Ctrl+C stops the command that is running; Ctrl+D or `/exit` quits.
 
-| Variable | Default | |
+**Everything lives on chat.deepseek.com.** The account's chats *are* the session list, and each
+chat's messages *are* the history. Nothing is stored locally except your captured credentials, so
+you can stop the agent and pick the same chat up later — even from another machine.
+
+## How a reply becomes a command
+
+The whole protocol is one line, said once at the start of a chat:
+
+> I’m working in a shell. When a command is needed, give me only one command in a single `sh`
+> block at a time; otherwise, don’t include a command block. I’ll run it and paste the output back
+> to you.
+
+So a reply is read like this:
+
+- the **first fenced block that is a command** is run — one block per turn, in order;
+- `sh`, `bash`, `cmd`, `powershell`, an untagged block, an unclosed block at the end, and tags
+  like `{.sh}` or `cmd.exe` all count;
+- a block tagged `json`, `text`, `python`, `diff`, … is a snippet, not a command. It stays in the
+  reply as prose, and if the reply ends there the CLI notes that it was not run — a command is
+  never dropped in silence;
+- **no block at all means the task is finished** (or the model needs an answer from you), and the
+  reply is printed as the final answer.
+
+## How a command is run
+
+`spawn(command, { shell: true })` — the platform's own shell does the work, so the same code runs
+everywhere without guessing at shell paths: `cmd.exe` on Windows, `/bin/sh` elsewhere. Set
+`ANYAGENT_SHELL` to a shell (a real `bash.exe`, for example) to use that instead.
+
+stdout and stderr are collected in arrival order and sent back to the model with the exit code:
+
+```
+(no output)
+Process exited with 0
+```
+
+A failing command is **not** an error. The output goes back like any other, so the model can read
+what broke and try again.
+
+## Environment
+
+| Variable | Default | Meaning |
 |---|---|---|
-| `DEEPSEEK_SESSION_JSON` | — | the captured session inline, or `DEEPSEEK_SESSION_PATH` for a file |
-| `ANYAGENT_HEADLESS` | `1` | `0` shows the browser window |
-| `ANYAGENT_BROWSER` | — | `edge`, `chrome`, `chromium` or `bundled` — pick one by name |
-| `ANYAGENT_BROWSER_PATH` | — | use a specific browser instead of the one found |
-| `ANYAGENT_PROFILE_DIR` | `~/.anyagent/browser` | where the browser profile lives |
-| `ANYAGENT_PACE_MS` | `300` | pause before each prompt |
-| `ANYAGENT_DEBUG` | off | keep each turn's raw response in the profile dir |
-| `ANYAGENT_ANSWER_TIMEOUT_MS` | `180000` | how long to wait for the answer to appear |
-| `ANYAGENT_SHELL` | a real bash, else `cmd.exe` on Windows | shell the commands run in (must take `-c`, or be `cmd.exe`) |
-| `DEEPSEEK_THINKING_ENABLED` | on | deep thinking, per message — you never see the thinking; `0` turns it off entirely |
-| `DEEPSEEK_SEARCH_ENABLED` | off | web search, per message |
-| `DEEPSEEK_MAX_ITERATIONS` | `50` | loop limit |
-| `DEEPSEEK_SHELL_TIMEOUT_MS` | `120000` | command timeout |
+| `DEEPSEEK_SESSION_JSON` | — | the credentials inline instead of in the file |
+| `DEEPSEEK_SESSION_PATH` | `./DEEPSEEK_SESSION_JSON` | where to read them from |
+| `DEEPSEEK_MODEL_TYPE` | backend default | e.g. `deepseek-reasoner` |
+| `DEEPSEEK_THINKING_ENABLED` | `1` | deep thinking. The reasoning is always discarded, never shown or run |
+| `DEEPSEEK_SEARCH_ENABLED` | `0` | web search |
+| `DEEPSEEK_MAX_ITERATIONS` | `50` | commands per task before it stops |
+| `DEEPSEEK_SHELL_TIMEOUT_MS` | `120000` | per-command timeout |
+| `ANYAGENT_SHELL` | platform shell | shell to run commands in |
+| `ANYAGENT_HOST` | `https://chat.deepseek.com` | used by the tests |
 
-## When a turn gets no answer
+## Windows
 
-A turn that produces nothing is reported with the reason, because an empty
-reply, a rejected session and a stalled stream look identical from outside:
+Works as-is on Windows 10 — the banner tells you which shell commands run in:
 
 ```
-chat.deepseek.com refused this turn (code 40003: Authorization Failed (invalid token)).
-
-This is the captured DeepSeek session expiring - re-capture the authorization
-and cookie headers from chat.deepseek.com into DEEPSEEK_SESSION_JSON.
-
-Run with ANYAGENT_HEADLESS=0 to watch the browser window and see what the page does.
+Shell:     cmd (C:\Windows\system32\cmd.exe)
 ```
 
-That last line is worth taking when anything is unclear: the window is hidden by
-default, so `ANYAGENT_HEADLESS=0` is the only way to see what the page actually
-did. Your conversation is not stored locally, so a run that ends badly leaves
-the chat on the site untouched.
-
-If none of the three readings produced anything, the response is written out
-next to the browser profile — `<profile>/last-turn.txt`, with the page URL, the
-status and the raw body — and the error names the path. That file is the whole
-story of a turn the reader could not make sense of.
+Commands are handed to `cmd.exe`, so `dir`, `type` and `echo %time%` work natively. Install Git
+for Windows and set `ANYAGENT_SHELL` to the `bash.exe` in `Git\bin` if you would rather have bash.
 
 ## Tests
 
@@ -277,26 +138,33 @@ story of a turn the reader could not make sense of.
 npm test
 ```
 
-`test-agent.mjs` covers the protocol with no browser: which blocks count as a
-command, what gets pasted back, when a task ends, and the loop's failure paths.
+Two suites, both real:
 
-`test-live.mjs` drives the real `dist/cli.js` through a real Chromium against a
-stand-in chat.deepseek.com — HTTPS on localhost, mapped to the real hostname at
-the browser level, so the production transport runs unmodified. It checks the
-command actually runs, the output is what gets typed back, the setup is not
-repeated in a resumed chat, and a failing command reaches the model.
+- **`test-agent.mjs`** — offline. Which reply text is a command, which stream text is the answer,
+  the starter prompt, and the shell runner actually running (`exit 3` is reported as 3, stderr is
+  never hidden).
+- **`test-http.mjs`** — end to end. The real CLI, real HTTP, real proof-of-work module and a real
+  command creating a real file, against a stand-in chat.deepseek.com on localhost. It checks that
+  the answer is pasted back as the output plus the exit code, and that a command which appeared
+  only in the model's *thinking* is **not** run.
 
-## WARNING
+## Notes
 
-This runs shell commands and modifies files. Only run it in a directory and
-environment you trust. It is not sandboxed.
+- **Proof of work is best effort.** The challenge is solved with the `sha3_wasm_bg.wasm` that
+  ships here; if this build cannot solve one, the request is still sent and whatever the backend
+  says about it is what you see — instead of a local "could not be solved" that explains nothing.
+- **The model's thinking is never read.** A message arrives as typed fragments (thinking,
+  answer), and only the fragments that declare themselves the answer are used. A command the model
+  merely *considered* cannot be run.
+- **A dropped connection is not a lost answer.** If a turn comes back empty, the chat is checked
+  for the answer DeepSeek stored anyway before asking again.
 
----
+## Other versions
 
-Other backends, kept on their own branches and tags:
-
-| | |
+| Version | What it is |
 |---|---|
-| `direct-api` · `v1.0.0` | calls the DeepSeek HTTP API directly with a key |
-| `deepseek-web` · `v2.0.0` | browser-driven, strict `{"text","command"}` protocol |
-| `ollama` · `v3.0.1` | local Ollama models, zero runtime dependencies |
+| `main` (v5.0.0) | this one — direct HTTPS, the `sh`-block protocol |
+| `browser` (v4.0.1) | drives chat.deepseek.com in a real browser |
+| `ollama` (v3.0.1) | the same agent against a local Ollama model |
+| `deepseek-web` (v2.0.0) | browser transport, JSON `{"text","command"}` protocol |
+| `direct-api` (v1.0.0) | the first direct version, JSON tool protocol |

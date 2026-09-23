@@ -1,7 +1,7 @@
 {
   "name": "anyagent",
-  "version": "4.0.1",
-  "description": "Personal CLI agent that drives chat.deepseek.com in a real browser — a normal chat where the model writes the commands and the output gets pasted back, with no API key",
+  "version": "5.0.0",
+  "description": "Personal CLI agent that talks straight to chat.deepseek.com over HTTPS — a normal chat where the model writes one shell command at a time and the output is pasted back, with no API key and no browser",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -19,12 +19,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node test-agent.mjs && node test-live.mjs",
+    "test": "npm run build && node test-agent.mjs && node test-http.mjs",
     "prestart": "npm run build",
     "start": "node dist/cli.js"
-  },
-  "dependencies": {
-    "playwright": "^1.63.0"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
