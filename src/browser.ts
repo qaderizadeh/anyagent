@@ -95,6 +95,11 @@ function nameFor(file: string): string {
 /**
  * Browsers already installed on this machine, best first.
  *
+ * On Windows Edge comes first: it ships with the system, so it is the browser
+ * that is expected to be there - driving a Chrome install where Chrome is not
+ * the default is the more unusual of the two. ANYAGENT_BROWSER picks a
+ * different one by name.
+ *
  * Only Chromium-family browsers can be driven, so a system Firefox is of no
  * use here: Playwright needs its own patched build, which is what
  * `npx playwright install firefox` would download.
@@ -108,12 +113,13 @@ function systemBrowsers(): Candidate[] {
     const at = (root: string | undefined, rest: string): string | undefined =>
       root == null || root === "" ? undefined : path.join(root, rest);
     paths.push(
-      at(env["PROGRAMFILES"], "Google/Chrome/Application/chrome.exe"),
-      at(env["PROGRAMFILES(X86)"], "Google/Chrome/Application/chrome.exe"),
-      at(env["LOCALAPPDATA"], "Google/Chrome/Application/chrome.exe"),
+      // Edge before Chrome - see the note above.
       at(env["PROGRAMFILES(X86)"], "Microsoft/Edge/Application/msedge.exe"),
       at(env["PROGRAMFILES"], "Microsoft/Edge/Application/msedge.exe"),
       at(env["LOCALAPPDATA"], "Microsoft/Edge/Application/msedge.exe"),
+      at(env["PROGRAMFILES"], "Google/Chrome/Application/chrome.exe"),
+      at(env["PROGRAMFILES(X86)"], "Google/Chrome/Application/chrome.exe"),
+      at(env["LOCALAPPDATA"], "Google/Chrome/Application/chrome.exe"),
     );
   } else if (process.platform === "darwin") {
     paths.push(
@@ -146,12 +152,32 @@ function systemBrowsers(): Candidate[] {
 }
 
 /**
+ * A browser named by ANYAGENT_BROWSER: `edge`, `chrome`, `chromium` or
+ * `bundled`. Nothing here is a guess - the name has to match a real file.
+ */
+function matchesName(name: string, candidate: Candidate): boolean {
+  if (name === "bundled") return candidate.path === undefined;
+  if (candidate.path === undefined) return false;
+  const file = path.basename(candidate.path).toLowerCase();
+  if (name === "edge") return file.includes("msedge");
+  if (name === "chrome") return file.includes("chrome") && !file.includes("chromium");
+  return file.includes(name);
+}
+
+function browserWanted(): string {
+  return (process.env["ANYAGENT_BROWSER"] ?? "").trim().toLowerCase();
+}
+
+/**
  * What to try, in order: the browser you configured, then the machine's own,
  * then Playwright's own downloadable Chromium as the last resort.
  */
 function launchOrder(configured: string): Candidate[] {
   if (configured !== "") return [{ name: `${nameFor(configured)} (configured)`, path: configured }];
-  return [...systemBrowsers(), { name: "Chromium (bundled)" }];
+  const order = [...systemBrowsers(), { name: "Chromium (bundled)" }];
+  const want = browserWanted();
+  if (want === "" || want === "any") return order;
+  return order.filter((candidate) => matchesName(want, candidate));
 }
 
 /** Where the persistent browser profile lives - this is the login. */
@@ -169,6 +195,16 @@ function boolEnv(name: string, fallback: boolean): boolean {
   const raw = process.env[name];
   if (raw == null || raw.trim() === "") return fallback;
   return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+}
+
+/**
+ * The window is hidden by default, which also hides whatever the page is doing
+ * - so when a turn goes wrong, say how to look at it.
+ */
+function windowHint(): string {
+  return boolEnv("ANYAGENT_HEADLESS", true)
+    ? "\n\nRun with ANYAGENT_HEADLESS=0 to watch the browser window and see what the page does."
+    : "";
 }
 
 /* ------------------------------------------------------------------ */
@@ -356,11 +392,24 @@ export class Browser {
     const headless = boolEnv("ANYAGENT_HEADLESS", true);
     const configured = (process.env["ANYAGENT_BROWSER_PATH"] ?? "").trim();
 
+    const order = launchOrder(configured);
+    if (order.length === 0) {
+      // Asked for a browser that is not here: say so rather than quietly use
+      // another one, which would look like the setting did nothing.
+      const installed = systemBrowsers().map((candidate) => candidate.name);
+      throw new Error(
+        `ANYAGENT_BROWSER=${browserWanted()} but no such browser is installed.\n\n` +
+          `Found: ${installed.length > 0 ? installed.join(", ") : "no Chrome, Edge or Chromium"}\n\n` +
+          "Unset ANYAGENT_BROWSER to use whatever is there, or point\n" +
+          "ANYAGENT_BROWSER_PATH at a browser of your choosing.",
+      );
+    }
+
     const failures: string[] = [];
     let context: BrowserContext | undefined;
     let chosen = "";
 
-    for (const attempt of launchOrder(configured)) {
+    for (const attempt of order) {
       try {
         context = await chromium.launchPersistentContext(dir, {
           headless,
@@ -539,12 +588,13 @@ export class Browser {
       throw new Error(
         `DeepSeek never sent ${COMPLETION_PATH}, so this turn did not go out.\n` +
           (seen.length > 0 ? `Requests seen: ${seen.join(", ")}` : "No request was seen at all.") +
-          "\nSend one message by hand in the browser window to check it goes through.",
+          "\nSend one message by hand in the browser window to check it goes through." +
+          windowHint(),
       );
     }
 
-    const body = await withTimeout(started.body(), COMPLETION_TIMEOUT_MS);
-    const raw = body == null ? "" : body.toString("utf8");
+    const status = started.status();
+    const { raw, error } = await this.readBody(started);
     const reply = raw === "" ? null : parseStream(raw);
 
     if (reply !== null && reply.text.trim() !== "") {
@@ -554,7 +604,36 @@ export class Browser {
 
     // DeepSeek keeps generating and stores the answer even when the stream
     // breaks, so look there before reporting an empty turn.
-    return (await this.recoverAnswer()) ?? reply ?? { text: "" };
+    const recovered = await this.recoverAnswer();
+    if (recovered !== null) return recovered;
+
+    // Nothing to recover either. A rejected session, a rate limit and a body
+    // that never finished arriving all end up here, and they look identical
+    // unless the response itself is allowed to say what went wrong.
+    const problem = noAnswer(status, raw, error);
+    if (problem !== null) throw new Error(problem + windowHint());
+
+    return { text: "" };
+  }
+
+  /**
+   * The response body, plus why there is none. A stream that never ends and a
+   * connection that breaks halfway both have to be told apart from an answer
+   * that really was empty.
+   */
+  private async readBody(response: Response): Promise<{ raw: string; error: string | null }> {
+    try {
+      const body = await withTimeout(response.body(), COMPLETION_TIMEOUT_MS);
+      if (body === null) {
+        return {
+          raw: "",
+          error: `nothing had arrived after ${Math.round(COMPLETION_TIMEOUT_MS / 1000)}s`,
+        };
+      }
+      return { raw: body.toString("utf8"), error: null };
+    } catch (error) {
+      return { raw: "", error: error instanceof Error ? error.message : String(error) };
+    }
   }
 
   private waitForCompletion(ms: number): Promise<Response | null> {
@@ -737,14 +816,70 @@ export class Browser {
 /* responses                                                           */
 /* ------------------------------------------------------------------ */
 
-function json(text: string): Record<string, unknown> {
+function tryJson(text: string): Record<string, unknown> | null {
   try {
     const parsed: unknown = JSON.parse(text);
-    if (parsed !== null && typeof parsed === "object") return parsed as Record<string, unknown>;
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
   } catch {
-    // fall through to the error below
+    // not JSON
   }
+  return null;
+}
+
+function json(text: string): Record<string, unknown> {
+  const parsed = tryJson(text);
+  if (parsed !== null) return parsed;
   throw new Error(`Unexpected response from chat.deepseek.com:\n${text.slice(0, 200)}`);
+}
+
+/** A short, single-line look at whatever came back, for an error message. */
+function preview(raw: string, max = 300): string {
+  const flat = raw.replace(/\s+/g, " ").trim();
+  if (flat === "") return "(the response had no body)";
+  return flat.length > max ? `${flat.slice(0, max)}...` : flat;
+}
+
+const SESSION_HINT =
+  "This is the captured DeepSeek session expiring - re-capture the authorization\n" +
+  "and cookie headers from chat.deepseek.com into DEEPSEEK_SESSION_JSON.";
+
+/**
+ * Why a turn produced no answer, when what came back says why. Null when
+ * nothing points at a cause, and the turn is simply empty.
+ */
+function noAnswer(status: number, raw: string, error: string | null): string | null {
+  // DeepSeek reports its own refusals in the body, usually with HTTP 200 - a
+  // bad token or a rate limit arrives as a code, not as a status.
+  const envelope = tryJson(raw);
+  if (envelope !== null) {
+    const code = envelope["code"] ?? envelope["biz_code"];
+    if (typeof code === "number" && code !== 0) {
+      const msg = envelope["msg"] ?? envelope["biz_msg"] ?? envelope["message"];
+      const detail = typeof msg === "string" && msg.trim() !== "" ? `: ${msg.trim()}` : "";
+      return (
+        `chat.deepseek.com refused this turn (code ${code}${detail}).\n\n` + SESSION_HINT
+      );
+    }
+  }
+
+  if (status !== 200) {
+    return (
+      `chat.deepseek.com answered this turn with HTTP ${status}.\n\n` +
+      `${preview(raw)}\n` +
+      (status === 401 || status === 403 ? `\n${SESSION_HINT}` : "")
+    );
+  }
+
+  if (error !== null) {
+    return (
+      `No answer arrived: ${error}.\n\n` +
+      "DeepSeek may still be generating it - the chat on the site has whatever it produced."
+    );
+  }
+
+  return null;
 }
 
 /** Unwrap the {"code":0,"data":{"biz_data":{...}}} envelope. */

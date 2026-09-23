@@ -120,6 +120,13 @@ The window is **hidden** by default, and the sign-in is the `authorization` and
 `cookie` you already capture from your browser, put in before the page's
 scripts run. Nothing is typed; the prompt is pasted in one go.
 
+It drives a browser that is already on the machine, and on Windows that means
+**Edge first**, then Chrome, then Chromium — Edge ships with the system, so it
+is the browser that is meant to be there. `ANYAGENT_BROWSER` picks one by name
+when the machine has several and the choice matters, and
+`ANYAGENT_BROWSER_PATH` takes a path. Playwright's own bundled Chromium is the
+last resort.
+
 ## Install
 
 ```bash
@@ -187,6 +194,7 @@ session alive, so the model sees what failed and can try something else.
 |---|---|---|
 | `DEEPSEEK_SESSION_JSON` | — | the captured session inline, or `DEEPSEEK_SESSION_PATH` for a file |
 | `ANYAGENT_HEADLESS` | `1` | `0` shows the browser window |
+| `ANYAGENT_BROWSER` | — | `edge`, `chrome`, `chromium` or `bundled` — pick one by name |
 | `ANYAGENT_BROWSER_PATH` | — | use a specific browser instead of the one found |
 | `ANYAGENT_PROFILE_DIR` | `~/.anyagent/browser` | where the browser profile lives |
 | `ANYAGENT_PACE_MS` | `300` | pause before each prompt |
@@ -195,6 +203,25 @@ session alive, so the model sees what failed and can try something else.
 | `DEEPSEEK_SEARCH_ENABLED` | off | web search, per message |
 | `DEEPSEEK_MAX_ITERATIONS` | `50` | loop limit |
 | `DEEPSEEK_SHELL_TIMEOUT_MS` | `120000` | command timeout |
+
+## When a turn gets no answer
+
+A turn that produces nothing is reported with the reason, because an empty
+reply, a rejected session and a stalled stream look identical from outside:
+
+```
+chat.deepseek.com refused this turn (code 40003: Authorization Failed (invalid token)).
+
+This is the captured DeepSeek session expiring - re-capture the authorization
+and cookie headers from chat.deepseek.com into DEEPSEEK_SESSION_JSON.
+
+Run with ANYAGENT_HEADLESS=0 to watch the browser window and see what the page does.
+```
+
+That last line is worth taking when anything is unclear: the window is hidden by
+default, so `ANYAGENT_HEADLESS=0` is the only way to see what the page actually
+did. Nothing is stored locally, so a run that ends badly leaves your chat
+untouched on the site.
 
 ## Tests
 

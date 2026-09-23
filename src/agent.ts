@@ -30,6 +30,13 @@ const RETRY_DELAY_MS = 2_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
 
+/** The window is hidden by default, which also hides whatever the page is doing. */
+function windowHint(): string {
+  const raw = (process.env["ANYAGENT_HEADLESS"] ?? "").trim().toLowerCase();
+  const hidden = raw === "" || ["1", "true", "yes", "on"].includes(raw);
+  return hidden ? "\nRun with ANYAGENT_HEADLESS=0 to watch the browser window." : "";
+}
+
 function intEnv(name: string, fallback: number): number {
   const value = Number(process.env[name]);
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
@@ -406,7 +413,8 @@ export class Agent {
           throw new Error(
             `Nothing came back from DeepSeek ${quiet} times in a row, so the task stopped here.\n` +
               "No reply arrived and none was stored on the backend, so there is nothing to recover.\n" +
-              "Your chat is intact on chat.deepseek.com - send the task again, or use /new.",
+              "Your chat is intact on chat.deepseek.com - send the task again, or use /new." +
+              windowHint(),
           );
         }
         await sleep(RETRY_DELAY_MS * quiet);

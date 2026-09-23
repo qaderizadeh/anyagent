@@ -75,6 +75,8 @@ let replies = [];
 const prompts = [];
 /** Every completion request body, so the thinking/search switches can be checked. */
 const bodies = [];
+/** Set to make the site refuse the completion: { status, body }. */
+let completionFailure = null;
 
 const page = (known) => `<!doctype html>
 <html><head><meta charset="utf-8"><title>DeepSeek</title></head>
@@ -184,6 +186,12 @@ const server = https.createServer({ key: fs.readFileSync(key), cert: fs.readFile
       prompts.push(String(body.prompt ?? ""));
       bodies.push(body);
 
+      if (completionFailure !== null) {
+        res.writeHead(completionFailure.status, { "content-type": "application/json" });
+        res.end(completionFailure.body);
+        return;
+      }
+
       const reply = replies[index] ?? "";
       const lines = [
         "event: ready",
@@ -270,11 +278,11 @@ const cliEnv = {
   ANYAGENT_PACE_MS: "0",
 };
 
-function runCli(args, input) {
+function runCli(args, input, extraEnv = {}) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [path.join(ROOT, "dist/cli.js"), ...args], {
       cwd: ROOT,
-      env: cliEnv,
+      env: { ...cliEnv, ...extraEnv },
       stdio: ["pipe", "pipe", "pipe"],
     });
     let out = "";
@@ -484,6 +492,63 @@ await test("the banner is printed once", () => {
 await test("/exit quits", () => {
   assert.match(interactive.out, /Bye\./);
   assert.equal(interactive.code, 0, interactive.out + interactive.err);
+});
+
+/* ------------------------------------------------------------------ */
+console.log("\n== a turn the backend answers with a refusal ==\n");
+/* ------------------------------------------------------------------ */
+
+// DeepSeek reports a rejected session in the body with HTTP 200, so a client
+// that only reads the stream sees an empty turn and reports nothing useful.
+prompts.length = 0;
+replies = [];
+completionFailure = {
+  status: 200,
+  body: JSON.stringify({ code: 40003, msg: "Authorization Failed (invalid token)" }),
+};
+const refused = await runCli(["--cwd", project, "do something"]);
+completionFailure = null;
+
+await test("a refusal in the body is reported, not swallowed as an empty turn", () => {
+  const seen = refused.out + refused.err;
+  assert.notEqual(refused.code, 0);
+  assert.match(seen, /40003/);
+  assert.match(seen, /Authorization Failed/);
+  assert.match(seen, /re-capture/i);
+});
+
+prompts.length = 0;
+replies = [];
+completionFailure = { status: 503, body: "<html><body>Service Unavailable</body></html>" };
+const unavailable = await runCli(["--cwd", project, "do something"]);
+completionFailure = null;
+
+await test("an HTTP failure says the status and shows what came back", () => {
+  const seen = unavailable.out + unavailable.err;
+  assert.notEqual(unavailable.code, 0);
+  assert.match(seen, /HTTP 503/);
+  assert.match(seen, /Service Unavailable/);
+});
+
+await test("the failure says how to watch the hidden browser", () => {
+  assert.match(refused.out + refused.err, /ANYAGENT_HEADLESS=0/);
+});
+
+/* ------------------------------------------------------------------ */
+console.log("\n== asking for a browser that is not here ==\n");
+/* ------------------------------------------------------------------ */
+
+const wrongBrowser = await runCli(["--cwd", project, "hi"], undefined, {
+  ANYAGENT_BROWSER: "netscape",
+  ANYAGENT_BROWSER_PATH: "",
+});
+
+await test("says the named browser is missing instead of using another one", () => {
+  const seen = wrongBrowser.out + wrongBrowser.err;
+  assert.notEqual(wrongBrowser.code, 0);
+  assert.match(seen, /ANYAGENT_BROWSER=netscape/);
+  assert.match(seen, /no such browser is installed/);
+  assert.match(seen, /ANYAGENT_BROWSER_PATH/);
 });
 
 /* ------------------------------------------------------------------ */
