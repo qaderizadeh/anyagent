@@ -127,6 +127,26 @@ when the machine has several and the choice matters, and
 `ANYAGENT_BROWSER_PATH` takes a path. Playwright's own bundled Chromium is the
 last resort.
 
+### How the answer is read back
+
+The reply is not taken from the response body alone. Three independent readings
+of the same turn are used, because any one of them can fail while the others are
+fine:
+
+1. **What the page shows** — the rendered message, with its code fences put
+   back. This is what a person reads, and it cannot drift out of step with the
+   site: if the answer is on screen, we have it. Reasoning is skipped, so a
+   command that was only *thought about* is never run.
+2. **What the chat stored** — the raw message, which is the whole answer rather
+   than whatever had rendered by then.
+3. **The response body** — its streamed chunks are parsed, and this is what says
+   the turn is *over*.
+
+This matters because a chunk shape we do not recognise parses to an empty turn,
+and an empty turn is indistinguishable from a site that said nothing. Earlier
+versions read the response only, so a shape change on the site looked like
+silence rather than like a bug — see *When a turn gets no answer*.
+
 ## Install
 
 ```bash
@@ -198,6 +218,7 @@ session alive, so the model sees what failed and can try something else.
 | `ANYAGENT_BROWSER_PATH` | — | use a specific browser instead of the one found |
 | `ANYAGENT_PROFILE_DIR` | `~/.anyagent/browser` | where the browser profile lives |
 | `ANYAGENT_PACE_MS` | `300` | pause before each prompt |
+| `ANYAGENT_ANSWER_TIMEOUT_MS` | `180000` | how long to wait for the answer to appear |
 | `ANYAGENT_SHELL` | a real bash, else `cmd.exe` on Windows | shell the commands run in (must take `-c`, or be `cmd.exe`) |
 | `DEEPSEEK_THINKING_ENABLED` | on | deep thinking, per message |
 | `DEEPSEEK_SEARCH_ENABLED` | off | web search, per message |
@@ -220,8 +241,13 @@ Run with ANYAGENT_HEADLESS=0 to watch the browser window and see what the page d
 
 That last line is worth taking when anything is unclear: the window is hidden by
 default, so `ANYAGENT_HEADLESS=0` is the only way to see what the page actually
-did. Nothing is stored locally, so a run that ends badly leaves your chat
-untouched on the site.
+did. Your conversation is not stored locally, so a run that ends badly leaves
+the chat on the site untouched.
+
+If none of the three readings produced anything, the response is written out
+next to the browser profile — `<profile>/last-turn.txt`, with the page URL, the
+status and the raw body — and the error names the path. That file is the whole
+story of a turn the reader could not make sense of.
 
 ## Tests
 

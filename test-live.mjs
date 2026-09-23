@@ -77,6 +77,15 @@ const prompts = [];
 const bodies = [];
 /** Set to make the site refuse the completion: { status, body }. */
 let completionFailure = null;
+/** The shape the streamed reply arrives in. */
+let streamShape = "pointer";
+/** Whether the page renders the answer into a .ds-markdown block. */
+let renderAnswer = true;
+/** Whether the backend keeps what was said, for the history endpoint. */
+let storeAnswers = true;
+/** What the fake backend has stored, and the next id it would give a message. */
+const messages = [];
+let nextId = 6;
 
 const page = (known) => `<!doctype html>
 <html><head><meta charset="utf-8"><title>DeepSeek</title></head>
@@ -114,6 +123,27 @@ const page = (known) => `<!doctype html>
       // The real site puts the new chat's id in the address bar straight away.
       const id = response.headers.get('x-chat-id');
       if (id) { window.__chatId = id; history.replaceState(null, '', '/a/chat/s/' + id); }
+      // ...and renders the answer into the message list as it arrives.
+      const rendered = response.headers.get('x-rendered');
+      if (rendered) {
+        const box = document.createElement('div');
+        box.className = 'ds-markdown';
+        for (const part of JSON.parse(atob(rendered))) {
+          if (part.type === 'code') {
+            const pre = document.createElement('pre');
+            const code = document.createElement('code');
+            code.className = 'language-' + part.lang;
+            code.textContent = part.text;
+            pre.appendChild(code);
+            box.appendChild(pre);
+          } else {
+            const p = document.createElement('p');
+            p.textContent = part.text;
+            box.appendChild(p);
+          }
+        }
+        document.getElementById('app').appendChild(box);
+      }
       return response.text();
     }).catch(() => {});
   }
@@ -129,6 +159,25 @@ const MISSING_PAGE = page("false");
 
 function envelope(data) {
   return JSON.stringify({ code: 0, msg: "ok", data: { biz_data: data } });
+}
+
+/**
+ * The answer as the page would render it: prose as text, each fenced block as a
+ * real <pre><code>, so the reader has to put the fences back the way the site's
+ * markup makes it.
+ */
+function renderedHeader(reply) {
+  const parts = [];
+  const fenced = /```([\w+-]*)\r?\n([\s\S]*?)```/g;
+  let last = 0;
+  let match;
+  while ((match = fenced.exec(reply)) !== null) {
+    if (match.index > last) parts.push({ type: "text", text: reply.slice(last, match.index) });
+    parts.push({ type: "code", lang: match[1], text: match[2] });
+    last = fenced.lastIndex;
+  }
+  if (last < reply.length) parts.push({ type: "text", text: reply.slice(last) });
+  return Buffer.from(JSON.stringify(parts)).toString("base64");
 }
 
 const server = https.createServer({ key: fs.readFileSync(key), cert: fs.readFileSync(cert) }, (req, res) => {
@@ -167,8 +216,15 @@ const server = https.createServer({ key: fs.readFileSync(key), cert: fs.readFile
   }
 
   if (url.pathname === "/api/v0/chat/history_messages") {
+    const asked = url.searchParams.get("chat_session_id") ?? "";
+    const list =
+      messages.length > 0
+        ? messages
+        : storeAnswers && asked === CHAT_ID
+          ? [{ message_id: 5, role: "ASSISTANT", content: "Earlier answer." }]
+          : [];
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(envelope({ chat_messages: [{ message_id: 5, role: "ASSISTANT", content: "Earlier answer." }] }));
+    res.end(envelope({ chat_messages: list }));
     return;
   }
 
@@ -193,6 +249,30 @@ const server = https.createServer({ key: fs.readFileSync(key), cert: fs.readFile
       }
 
       const reply = replies[index] ?? "";
+
+      if (storeAnswers) {
+        messages.push({ message_id: nextId++, role: "USER", content: String(body.prompt ?? "") });
+        messages.push({ message_id: nextId++, role: "ASSISTANT", content: reply });
+      }
+
+      const headers = { "content-type": "text/event-stream", "x-chat-id": CHAT_ID };
+      if (renderAnswer) headers["x-rendered"] = renderedHeader(reply);
+      res.writeHead(200, headers);
+
+      // A turn where the stream carries the reasoning and not the answer.
+      if (streamShape === "thinking-only") {
+        res.end(
+          [
+            "event: ready",
+            `data: ${JSON.stringify({ response_message_id: String(100 + index) })}`,
+            `data: ${JSON.stringify({ p: "response/thinking_content", o: "APPEND", v: "SHOULD-NOT-BE-THE-ANSWER" })}`,
+            `data: ${JSON.stringify({ p: "response/status", v: "FINISHED" })}`,
+            "",
+          ].join("\n"),
+        );
+        return;
+      }
+
       const lines = [
         "event: ready",
         `data: ${JSON.stringify({ response_message_id: String(100 + index) })}`,
@@ -202,12 +282,16 @@ const server = https.createServer({ key: fs.readFileSync(key), cert: fs.readFile
       const half = Math.ceil(reply.length / 2);
       for (const part of [reply.slice(0, half), reply.slice(half)]) {
         if (part === "") continue;
-        lines.push(`data: ${JSON.stringify({ p: "response/content", o: "APPEND", v: part })}`);
+        // The site sends fragments; the plain pointer shape has to keep working.
+        lines.push(
+          streamShape === "fragments"
+            ? `data: ${JSON.stringify({ p: "response/fragments", o: "APPEND", v: [{ type: "text", content: part }] })}`
+            : `data: ${JSON.stringify({ p: "response/content", o: "APPEND", v: part })}`,
+        );
       }
       lines.push(`data: ${JSON.stringify({ p: "response/status", v: "FINISHED" })}`, "");
 
-      res.writeHead(200, { "content-type": "text/event-stream", "x-chat-id": CHAT_ID });
-      res.end(lines.join("\n"));
+      res.end(streamShape === "none" ? "" : lines.join("\n"));
     });
     return;
   }
@@ -365,6 +449,8 @@ console.log("\n== a second task in a chat that is already open ==\n");
 /* ------------------------------------------------------------------ */
 
 prompts.length = 0;
+messages.length = 0;
+nextId = 6;
 replies = [
   "Looking now.\n\n```bash\npwd\n```",
   "You are in the project directory.",
@@ -392,6 +478,8 @@ console.log("\n== a failing command goes back to the model ==\n");
 /* ------------------------------------------------------------------ */
 
 prompts.length = 0;
+messages.length = 0;
+nextId = 6;
 replies = [
   "Trying that path.\n\n```bash\ncat /no/such/file\n```",
   "That file is not there.",
@@ -420,6 +508,8 @@ console.log("\n== a block fenced for Windows runs anyway ==\n");
 // Passing that over as prose is a command that never runs, which looks from the
 // outside exactly like an agent that does not execute anything.
 prompts.length = 0;
+messages.length = 0;
+nextId = 6;
 replies = [
   "Running it the Windows way.\n\n```cmd\necho from-cmd-block > cmd-marker.txt && cat cmd-marker.txt\n```",
   'Done - it printed from-cmd-block.\n\n```json\n{"ran": true}\n```',
@@ -446,6 +536,8 @@ console.log("\n== the model shows something without asking for a command ==\n");
 /* ------------------------------------------------------------------ */
 
 prompts.length = 0;
+messages.length = 0;
+nextId = 6;
 replies = ['The config is:\n\n```json\n{"port": 3000}\n```\n\nAnything else?'];
 
 const fourth = await runCli(["--cwd", project, "show me the config"]);
@@ -464,6 +556,8 @@ console.log("\n== interactive mode ==\n");
 /* ------------------------------------------------------------------ */
 
 prompts.length = 0;
+messages.length = 0;
+nextId = 6;
 replies = [
   "Checking.\n\n```bash\necho from-the-shell\n```",
   "All done here.",
@@ -495,12 +589,109 @@ await test("/exit quits", () => {
 });
 
 /* ------------------------------------------------------------------ */
+console.log("\n== where the answer is read from ==\n");
+/* ------------------------------------------------------------------ */
+
+// Each reading has to stand on its own, because any one of them can fail while
+// the others are fine. A stream whose chunks we do not recognise used to parse
+// to an empty turn, which looked exactly like a site that said nothing.
+
+prompts.length = 0;
+messages.length = 0;
+nextId = 6;
+replies = [
+  "Writing it now.\n\n```bash\nprintf 'Fragments' > frag.txt && cat frag.txt\n```",
+  "Done - it printed Fragments.",
+];
+renderAnswer = false;
+storeAnswers = false;
+streamShape = "fragments";
+const fragments = await runCli(["--cwd", project, "write it from a fragments stream"]);
+
+await test("a fragment-shaped stream is read, not dropped on the floor", () => {
+  assert.equal(fragments.code, 0, fragments.out + fragments.err);
+  assert.equal(prompts.length, 2, `prompts: ${JSON.stringify(prompts)}`);
+  assert.equal(prompts[1], "Fragments");
+  assert.ok(fs.existsSync(path.join(project, "frag.txt")), "the command really ran");
+});
+
+prompts.length = 0;
+messages.length = 0;
+nextId = 6;
+replies = ["Reading it off the page.\n\n```bash\necho from-the-page\n```", "It came from the page."];
+renderAnswer = true;
+storeAnswers = false;
+streamShape = "none";
+const pageOnly = await runCli(["--cwd", project, "answer off the page"]);
+
+await test("the answer is read off the page when the response carries nothing", () => {
+  assert.equal(pageOnly.code, 0, pageOnly.out + pageOnly.err);
+  assert.equal(prompts[1], "from-the-page");
+  assert.match(pageOnly.out, /It came from the page\./);
+});
+
+prompts.length = 0;
+messages.length = 0;
+nextId = 6;
+replies = ["It is stored.\n\n```bash\necho from-the-chat\n```", "It came from the stored chat."];
+renderAnswer = false;
+storeAnswers = true;
+streamShape = "none";
+const storedOnly = await runCli(["--cwd", project, "answer from the stored chat"]);
+
+await test("the answer is read from what the chat stored when the page shows nothing", () => {
+  assert.equal(storedOnly.code, 0, storedOnly.out + storedOnly.err);
+  assert.equal(prompts[1], "from-the-chat");
+  assert.match(storedOnly.out, /It came from the stored chat\./);
+});
+
+prompts.length = 0;
+messages.length = 0;
+nextId = 6;
+replies = ["Thinking hard.\n\n```bash\necho real-answer\n```", "That was the real answer."];
+renderAnswer = true;
+storeAnswers = false;
+streamShape = "thinking-only";
+const thinkingOnly = await runCli(["--cwd", project, "do not read my thoughts"]);
+
+await test("reasoning in the stream is never taken for the answer", () => {
+  assert.equal(thinkingOnly.code, 0, thinkingOnly.out + thinkingOnly.err);
+  assert.equal(prompts[1], "real-answer", "the thinking must not be what the loop acts on");
+  assert.doesNotMatch(thinkingOnly.out, /SHOULD-NOT-BE-THE-ANSWER/);
+});
+
+prompts.length = 0;
+messages.length = 0;
+nextId = 6;
+replies = [];
+renderAnswer = false;
+storeAnswers = false;
+streamShape = "none";
+const unreadable = await runCli(["--cwd", project, "say something"]);
+
+streamShape = "pointer";
+renderAnswer = true;
+storeAnswers = true;
+
+await test("a turn nothing could be read from keeps the response for evidence", () => {
+  const seen = unreadable.out + unreadable.err;
+  assert.notEqual(unreadable.code, 0);
+  assert.match(seen, /Nothing came back from DeepSeek for this turn/);
+  assert.ok(
+    fs.existsSync(path.join(work, "profile", "last-turn.txt")),
+    "the response is saved so its shape can be looked at",
+  );
+});
+
+/* ------------------------------------------------------------------ */
 console.log("\n== a turn the backend answers with a refusal ==\n");
 /* ------------------------------------------------------------------ */
 
 // DeepSeek reports a rejected session in the body with HTTP 200, so a client
 // that only reads the stream sees an empty turn and reports nothing useful.
 prompts.length = 0;
+messages.length = 0;
+nextId = 6;
 replies = [];
 completionFailure = {
   status: 200,
@@ -518,6 +709,8 @@ await test("a refusal in the body is reported, not swallowed as an empty turn", 
 });
 
 prompts.length = 0;
+messages.length = 0;
+nextId = 6;
 replies = [];
 completionFailure = { status: 503, body: "<html><body>Service Unavailable</body></html>" };
 const unavailable = await runCli(["--cwd", project, "do something"]);
@@ -556,6 +749,8 @@ console.log("\n== a session that cannot be continued ==\n");
 /* ------------------------------------------------------------------ */
 
 prompts.length = 0;
+messages.length = 0;
+nextId = 6;
 replies = ["Fine."];
 const bad = await runCli(["--cwd", project, "--session", "99999999-9999-9999-9999-999999999999", "hello"]);
 

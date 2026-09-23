@@ -22,11 +22,20 @@ import { chromium, type BrowserContext, type Locator, type Page, type Response }
 
 const HOST = "https://chat.deepseek.com";
 const COMPLETION_PATH = "/api/v0/chat/completion";
-/** Chat ids in the address bar: /a/chat/s/<uuid> */
-const CHAT_URL = /\/a\/chat\/s\/([0-9a-z-]{8,})/i;
+/** Chat ids in the address bar. Newer builds drop the /a, older ones have it. */
+const CHAT_URL = /\/chat\/s\/([0-9a-z-]{8,})/i;
 
 const LOGIN_TIMEOUT_MS = intEnv("ANYAGENT_LOGIN_TIMEOUT_MS", 300_000);
 const COMPLETION_TIMEOUT_MS = intEnv("ANYAGENT_COMPLETION_TIMEOUT_MS", 300_000);
+/** How long to wait for the answer to appear on the page. */
+const ANSWER_WAIT_MS = intEnv("ANYAGENT_ANSWER_TIMEOUT_MS", 180_000);
+/** How often the page is looked at, and how still it has to be to be finished. */
+const POLL_MS = 500;
+const STABLE_POLLS = 4;
+/** Look at what the chat stored every N polls, rather than every poll. */
+const HISTORY_EVERY = 4;
+/** How long the page gets to catch up once the response has ended and said nothing. */
+const STALL_GRACE_MS = intEnv("ANYAGENT_STALL_GRACE_MS", 8_000);
 /** A short pause before each prompt: a fast person, not a machine. */
 const PACE_MS = intEnv("ANYAGENT_PACE_MS", 300);
 
@@ -47,6 +56,18 @@ export type HistoryMessage = {
 export type Completion = {
   text: string;
   messageId?: string;
+};
+
+/** One reading of a turn, filled in as the pieces arrive. */
+type Turn = {
+  answer: Completion | null;
+  problem: string | null;
+  status: number | null;
+  raw: string;
+  /** Whether DeepSeek's completion request was seen at all. */
+  sawResponse: boolean;
+  /** Whether the response has been read right through. */
+  done: boolean;
 };
 
 /** Deep thinking and web search, the two composer switches. */
@@ -573,17 +594,97 @@ export class Browser {
     return this.page.locator("#chat-input, textarea, [contenteditable='true']").filter({ visible: true }).last();
   }
 
-  /** One turn: paste the prompt, send it, and read DeepSeek's own response. */
+  /**
+   * One turn: paste the prompt, send it, and read the answer.
+   *
+   * Three independent readings of the same turn, because any one of them can
+   * let us down on its own: what the page shows, what the chat stored, and the
+   * response body. The response has the useful property of being finished or
+   * not, so it is what says the turn is over; the other two are what say what
+   * was said. A chunk shape we do not recognise used to parse to an empty turn,
+   * and an empty turn is indistinguishable from a site that said nothing.
+   */
   async ask(prompt: string): Promise<Completion> {
-    // The response has to be watched for before it is sent, or it is missed.
-    const pending = this.waitForCompletion(20_000);
+    const before = await this.renderedAnswer();
+    const beforeId = this.lastSeenId;
+    // Watched for from before the prompt is sent, or the response is missed.
+    const response = this.waitForCompletion(COMPLETION_TIMEOUT_MS);
+    const turn: Turn = { answer: null, problem: null, status: null, raw: "", sawResponse: false, done: false };
+    void response.then(
+      async (started) => {
+        turn.sawResponse = started !== null;
+        try {
+          const result = await this.readTurn(started);
+          turn.answer = result.answer;
+          turn.problem = result.problem;
+          turn.status = result.status;
+          turn.raw = result.raw;
+        } catch (error) {
+          turn.problem = error instanceof Error ? error.message : String(error);
+        } finally {
+          turn.done = true;
+        }
+      },
+      (error: unknown) => {
+        turn.problem = error instanceof Error ? error.message : String(error);
+        turn.done = true;
+      },
+    );
+
     await this.submit(prompt);
-    let started = await pending;
-    if (started === null) {
-      await this.clickSend();
-      started = await this.waitForCompletion(COMPLETION_TIMEOUT_MS);
+
+    const deadline = Date.now() + ANSWER_WAIT_MS;
+    let rendered = "";
+    let still = 0;
+    let poll = 0;
+    let stalledAt = 0;
+    while (Date.now() < deadline) {
+      // The response is in and readable: that is this turn.
+      if (turn.answer !== null) {
+        const stored = await this.storedAnswer(beforeId);
+        return stored ?? turn.answer;
+      }
+
+      const now = await this.renderedAnswer();
+      // Something new is on the page. It is finished when it stops changing.
+      if (now !== "" && now !== before) {
+        still = now === rendered ? still + 1 : 0;
+        rendered = now;
+        if (still >= STABLE_POLLS) {
+          // What the chat stored is the whole answer, not whatever had
+          // rendered by then, so prefer it when it is there.
+          const stored = await this.storedAnswer(beforeId);
+          return stored ?? { text: rendered };
+        }
+      }
+
+      poll += 1;
+      if (poll % HISTORY_EVERY === 0) {
+        const stored = await this.storedAnswer(beforeId);
+        if (stored !== null) return stored;
+      }
+
+      // Nothing has gone out: in case Enter did not submit, press the button.
+      if (!turn.sawResponse && poll === 12) await this.clickSend();
+
+      // The response is in and carried nothing, and the page has shown nothing.
+      // Give the page a moment to catch up, then stop waiting for it.
+      if (turn.done && rendered === "") {
+        if (stalledAt === 0) stalledAt = Date.now();
+        else if (Date.now() - stalledAt > STALL_GRACE_MS) break;
+      } else {
+        stalledAt = 0;
+      }
+
+      await sleep(POLL_MS);
     }
-    if (started === null) {
+
+    if (turn.answer !== null) return turn.answer;
+    // The response may still be arriving. Give it the rest of its own time.
+    await response.then(() => undefined, () => undefined);
+    if (turn.answer !== null) return turn.answer;
+
+    if (!turn.sawResponse) {
       const seen = [...new Set(this.posted)];
       throw new Error(
         `DeepSeek never sent ${COMPLETION_PATH}, so this turn did not go out.\n` +
@@ -593,27 +694,175 @@ export class Browser {
       );
     }
 
+    // A rejected session, a rate limit and an empty answer all end up here, and
+    // they look identical unless the response is allowed to say what happened.
+    if (turn.problem !== null) throw new Error(turn.problem + windowHint());
+
+    // Nothing on the page, nothing stored and nothing readable in the response.
+    // Keep the response itself, so its shape can be seen rather than guessed at.
+    throw new Error(
+      `Nothing came back from DeepSeek for this turn (HTTP ${turn.status}, ${turn.raw.length} bytes).\n` +
+        "The page showed no answer and the chat stored none, so the response was kept here:\n" +
+        `  ${this.saveDump(turn.raw, turn.status ?? 0)}\n` +
+        "Send that file to get the reader fixed." +
+        windowHint(),
+    );
+  }
+
+  /**
+   * What the response says this turn was. Never throws: a response we cannot
+   * read is a reason to read the page instead, not to end the turn.
+   */
+  private async readTurn(started: Response | null): Promise<{
+    answer: Completion | null;
+    problem: string | null;
+    status: number | null;
+    raw: string;
+  }> {
+    if (started === null) return { answer: null, problem: null, status: null, raw: "" };
+
     const status = started.status();
     const { raw, error } = await this.readBody(started);
-    const reply = raw === "" ? null : parseStream(raw);
-
-    if (reply !== null && reply.text.trim() !== "") {
-      if (reply.messageId) this.lastSeenId = Number(reply.messageId) || this.lastSeenId;
-      return reply;
+    try {
+      const reply = raw === "" ? null : parseStream(raw);
+      if (reply !== null && reply.text.trim() !== "") {
+        if (reply.messageId) this.lastSeenId = Number(reply.messageId) || this.lastSeenId;
+        return { answer: reply, problem: null, status, raw };
+      }
+    } catch (thrown) {
+      // A refusal inside the stream: DeepSeek said why, so keep that.
+      return {
+        answer: null,
+        problem: thrown instanceof Error ? thrown.message : String(thrown),
+        status,
+        raw,
+      };
     }
+    return { answer: null, problem: noAnswer(status, raw, error), status, raw };
+  }
 
-    // DeepSeek keeps generating and stores the answer even when the stream
-    // breaks, so look there before reporting an empty turn.
-    const recovered = await this.recoverAnswer();
-    if (recovered !== null) return recovered;
+  /**
+   * The answer as the page shows it, with its code fences put back.
+   *
+   * This is the one source that cannot drift out of step with the site: the
+   * model's words are on the screen because the site put them there. Reasoning
+   * is shown in a block of its own and is skipped - it is not the answer, and
+   * picking a command out of it would run something the model only thought
+   * about.
+   */
+  private async renderedAnswer(): Promise<string> {
+    const text = await this.page
+      .evaluate(() => {
+        type Node = {
+          nodeType: number;
+          nodeValue?: string | null;
+          textContent?: string | null;
+          tagName?: string;
+          className?: unknown;
+          getAttribute?: (name: string) => string | null;
+          querySelector?: (selector: string) => Node | null;
+          querySelectorAll?: (selector: string) => { length: number; [index: number]: Node };
+          childNodes?: { length: number; [index: number]: Node };
+        };
 
-    // Nothing to recover either. A rejected session, a rate limit and a body
-    // that never finished arriving all end up here, and they look identical
-    // unless the response itself is allowed to say what went wrong.
-    const problem = noAnswer(status, raw, error);
-    if (problem !== null) throw new Error(problem + windowHint());
+        const doc = (
+          globalThis as unknown as {
+            document: { querySelectorAll(selector: string): { length: number; [index: number]: Node } };
+          }
+        ).document;
 
-    return { text: "" };
+        const classOf = (node: Node): string =>
+          typeof node.className === "string" ? node.className : "";
+
+        const render = (node: Node): string => {
+          let out = "";
+          const children = node.childNodes;
+          if (children === undefined) return out;
+          for (let index = 0; index < children.length; index++) {
+            const child = children[index];
+            if (child === undefined) continue;
+            if (child.nodeType === 3) {
+              out += child.nodeValue ?? "";
+              continue;
+            }
+            if (child.nodeType !== 1) continue;
+            const classes = classOf(child);
+            if (/think|reason/i.test(classes)) continue;
+            const tag = (child.tagName ?? "").toLowerCase();
+            if (tag === "br") {
+              out += "\n";
+              continue;
+            }
+            if (tag === "pre") {
+              const code = child.querySelector?.("code") ?? child;
+              const language =
+                /language-([\w+#.-]+)/.exec(classOf(code))?.[1] ??
+                child.getAttribute?.("data-language") ??
+                "";
+              const body = (code.textContent ?? "").replace(/\n+$/, "");
+              out += `\n\`\`\`${language}\n${body}\n\`\`\`\n`;
+              continue;
+            }
+            if (tag === "code") {
+              out += `\`${child.textContent ?? ""}\``;
+              continue;
+            }
+            const inner = render(child);
+            out += /^(p|div|li|ul|ol|h[1-6]|blockquote|table|tr|pre|section|article)$/.test(tag)
+              ? `\n${inner}\n`
+              : inner;
+          }
+          return out;
+        };
+
+        // Most specific first, so a build that names it differently still works.
+        for (const selector of [".ds-markdown", '[class*="ds-markdown"]', '[class*="markdown"]']) {
+          let found;
+          try {
+            found = doc.querySelectorAll(selector);
+          } catch {
+            continue;
+          }
+          if (found.length === 0) continue;
+          const last = found[found.length - 1];
+          if (last === undefined || /think|reason/i.test(classOf(last))) continue;
+          const text = render(last).replace(/\n{3,}/g, "\n\n").trim();
+          if (text !== "") return text;
+        }
+        return "";
+      })
+      .catch(() => "");
+    return text.replace(/\n{3,}/g, "\n\n").trim();
+  }
+
+  /**
+   * The newest answer the chat has stored, when it is newer than the last one
+   * we saw. Reading it also moves `lastSeenId` on, so the same answer is never
+   * mistaken for the next turn's.
+   */
+  private async storedAnswer(afterId: number): Promise<Completion | null> {
+    const answers = (await this.history().catch(() => [])).filter(
+      (message) => message.role === "assistant" && message.content.trim() !== "",
+    );
+    const last = answers.length > 0 ? answers[answers.length - 1]! : null;
+    if (last === null) return null;
+    this.lastSeenId = Math.max(this.lastSeenId, last.id);
+    return last.id > afterId ? { text: last.content, messageId: String(last.id) } : null;
+  }
+
+  /** Keep the response of a turn that could not be read, so it can be looked at. */
+  private saveDump(raw: string, status: number): string {
+    const file = path.join(profileDir(), "last-turn.txt");
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(
+        file,
+        `when: ${new Date().toISOString()}\nurl: ${this.page.url()}\nstatus: ${status}\n\n${raw}\n`,
+      );
+      return file;
+    } catch {
+      return "(the response could not be saved)";
+    }
   }
 
   /**
@@ -670,27 +919,6 @@ export class Browser {
   }
 
   /** The answer DeepSeek stored for this turn, when the stream did not carry it. */
-  private async recoverAnswer(): Promise<Completion | null> {
-    for (let attempt = 0; attempt < 15; attempt++) {
-      await sleep(2_000);
-      const message = await this.lastAssistant().catch(() => null);
-      if (message === null) {
-        // No message for this turn at all: it was never stored, so stop early.
-        if (attempt >= 2) return null;
-        continue;
-      }
-      if (message.content.trim() !== "") return { text: message.content, messageId: String(message.id) };
-    }
-    return null;
-  }
-
-  private async lastAssistant(): Promise<HistoryMessage | null> {
-    const turn = (await this.history()).filter(
-      (message) => message.role === "ASSISTANT" && message.id > this.lastSeenId,
-    );
-    return turn.length > 0 ? turn[turn.length - 1]! : null;
-  }
-
   /** The chat currently open in the window, if any. */
   currentChatId(): string {
     return CHAT_URL.exec(this.page.url())?.[1] ?? "";
@@ -740,13 +968,19 @@ export class Browser {
     const data = bizData(
       await this.api(`/api/v0/chat/history_messages?chat_session_id=${encodeURIComponent(chatId)}`),
     );
-    const list = Array.isArray(data["chat_messages"]) ? data["chat_messages"] : [];
+    const list = Array.isArray(data["chat_messages"])
+      ? data["chat_messages"]
+      : Array.isArray(data["messages"])
+        ? data["messages"]
+        : [];
     return list
       .filter((item): item is Record<string, unknown> => item !== null && typeof item === "object")
       .map((item) => ({
-        id: Number(item["message_id"] ?? 0),
-        role: String(item["role"] ?? ""),
-        content: String(item["content"] ?? ""),
+        id: Number(item["message_id"] ?? item["id"] ?? 0),
+        // The role has been written both ways, and comparing case-sensitively
+        // quietly finds no answers at all when it is the other one.
+        role: String(item["role"] ?? "").toLowerCase(),
+        content: messageText(item["content"]),
       }));
   }
 
@@ -902,6 +1136,64 @@ function bizData(text: string): Record<string, unknown> {
  *   {"p":"response/status","v":"FINISHED"}              turn finished
  * `event: ready` carries the assistant message id.
  */
+/**
+ * Whether a stream field carries the answer, as opposed to reasoning, a status
+ * word or a counter. Everything is filtered by field name, because the same
+ * stream also carries {"p":"response/status","v":"FINISHED"} - and appending
+ * that to the answer would corrupt it.
+ */
+function isAnswerField(field: string): boolean {
+  if (field === "") return true;
+  if (/think|reason|status|usage|message_id|quasi/i.test(field)) return false;
+  return /content|fragment|text|response|answer/i.test(field);
+}
+
+/** A {"type":"text","content":"..."} entry, as the fragment lists use. */
+function isTextFragment(item: unknown): boolean {
+  if (item === null || typeof item !== "object" || Array.isArray(item)) return false;
+  const object = item as Record<string, unknown>;
+  return typeof object["content"] === "string" && typeof object["type"] === "string";
+}
+
+/**
+ * The text a JSON value carries, whatever shape it arrived in: a string, a list
+ * of fragments, a full response snapshot, or an object holding it under one of
+ * its usual names. The value has taken all of these shapes over the life of the
+ * site, and a shape we do not read is text silently lost.
+ */
+function messageText(value: unknown): string {
+  if (typeof value === "string") {
+    // Some payloads carry the fragment list as a JSON string.
+    const trimmed = value.trim();
+    if (trimmed.startsWith("[")) {
+      try {
+        const parsed: unknown = JSON.parse(trimmed);
+        if (Array.isArray(parsed) && parsed.length > 0 && parsed.every(isTextFragment)) {
+          return parsed.map((item) => String((item as Record<string, unknown>)["content"])).join("");
+        }
+      } catch {
+        // ordinary text that merely starts with a bracket
+      }
+    }
+    return value;
+  }
+  if (Array.isArray(value)) return value.map(messageText).join("");
+  if (value === null || typeof value !== "object") return "";
+
+  const object = value as Record<string, unknown>;
+  for (const key of ["content", "text", "value", "answer"]) {
+    if (typeof object[key] === "string") return object[key] as string;
+  }
+  for (const key of ["fragments", "contents", "items", "data"]) {
+    const inner = object[key];
+    if (inner !== undefined) {
+      const text = messageText(inner);
+      if (text !== "") return text;
+    }
+  }
+  return "";
+}
+
 function parseStream(raw: string): Completion {
   let text = "";
   let messageId = "";
@@ -947,22 +1239,35 @@ function parseStream(raw: string): Completion {
     event = "";
 
     if (typeof item["p"] === "string") field = item["p"];
-
     const value = item["v"];
-    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-      const full = (value as Record<string, unknown>)["response"];
-      if (full !== null && typeof full === "object") {
-        const response = full as Record<string, unknown>;
-        if (typeof response["content"] === "string") text = response["content"];
-        if (response["message_id"] != null) messageId = String(response["message_id"]);
-      }
-    } else if (typeof value === "string" && (field === "response/content" || field === "")) {
-      text += value;
-    }
 
     if (field === "response/message_id" && (typeof value === "number" || typeof value === "string")) {
       messageId = String(value);
+      continue;
     }
+
+    // Reasoning, usage counters and status words travel in the same stream and
+    // are not the answer. Only the fields the answer itself uses are read.
+    if (!isAnswerField(field)) continue;
+
+    // A whole-response snapshot replaces the answer; anything else adds to it.
+    const snapshot =
+      value !== null && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>)["response"]
+        : null;
+    if (snapshot !== null && typeof snapshot === "object") {
+      const whole = snapshot as Record<string, unknown>;
+      const full = messageText(whole["content"]);
+      if (full !== "") text = full;
+      if (whole["message_id"] != null) messageId = String(whole["message_id"]);
+      continue;
+    }
+
+    // Fragments arrive as a list of {type:"text",content:"..."}, and plain
+    // text arrives as a string. Both are the answer; a chunk we drop is
+    // silently lost, and enough of them make the whole turn look empty.
+    const piece = messageText(value);
+    if (piece !== "") text += piece;
   }
 
   return { text, messageId: messageId || undefined };
