@@ -83,6 +83,8 @@ let streamShape = "pointer";
 let renderAnswer = true;
 /** Whether the backend keeps what was said, for the history endpoint. */
 let storeAnswers = true;
+/** The shape a stored assistant message is handed back in. */
+let storedShape = "text";
 /** What the fake backend has stored, and the next id it would give a message. */
 const messages = [];
 let nextId = 6;
@@ -159,6 +161,18 @@ const MISSING_PAGE = page("false");
 
 function envelope(data) {
   return JSON.stringify({ code: 0, msg: "ok", data: { biz_data: data } });
+}
+
+/**
+ * A stored message: plain text, or the typed fragment list the site really uses
+ * - reasoning and answer side by side, told apart only by their fragment type.
+ */
+function stored(shape, reply) {
+  if (shape !== "fragments") return reply;
+  return [
+    { type: "THINK", content: "STORED-REASONING-SHOULD-NOT-SHOW " },
+    { type: "RESPONSE", content: reply },
+  ];
 }
 
 /**
@@ -252,7 +266,7 @@ const server = https.createServer({ key: fs.readFileSync(key), cert: fs.readFile
 
       if (storeAnswers) {
         messages.push({ message_id: nextId++, role: "USER", content: String(body.prompt ?? "") });
-        messages.push({ message_id: nextId++, role: "ASSISTANT", content: reply });
+        messages.push({ message_id: nextId++, role: "ASSISTANT", content: stored(storedShape, reply) });
       }
 
       const headers = { "content-type": "text/event-stream", "x-chat-id": CHAT_ID };
@@ -266,6 +280,26 @@ const server = https.createServer({ key: fs.readFileSync(key), cert: fs.readFile
             "event: ready",
             `data: ${JSON.stringify({ response_message_id: String(100 + index) })}`,
             `data: ${JSON.stringify({ p: "response/thinking_content", o: "APPEND", v: "SHOULD-NOT-BE-THE-ANSWER" })}`,
+            `data: ${JSON.stringify({ p: "response/status", v: "FINISHED" })}`,
+            "",
+          ].join("\n"),
+        );
+        return;
+      }
+
+      // The shape the live site actually sends: the reasoning and the answer in
+      // one fragment stream, each fragment's type named once and then followed
+      // by bare appends that carry no type at all.
+      if (streamShape === "reasoning") {
+        const half = Math.ceil(reply.length / 2);
+        res.end(
+          [
+            "event: ready",
+            `data: ${JSON.stringify({ response_message_id: String(100 + index) })}`,
+            `data: ${JSON.stringify({ p: "response/fragments", o: "APPEND", v: [{ id: 1, type: "THINK", content: "REASONING-SHOULD-NOT-SHOW " }] })}`,
+            `data: ${JSON.stringify({ v: [{ id: 1, content: "and a command I am only thinking about:\n\n```bash\necho bad > bad-marker.txt\n```" }] })}`,
+            `data: ${JSON.stringify({ p: "response/fragments", o: "APPEND", v: [{ id: 2, type: "RESPONSE", content: reply.slice(0, half) }] })}`,
+            `data: ${JSON.stringify({ v: reply.slice(half) })}`,
             `data: ${JSON.stringify({ p: "response/status", v: "FINISHED" })}`,
             "",
           ].join("\n"),
@@ -658,6 +692,60 @@ await test("reasoning in the stream is never taken for the answer", () => {
   assert.equal(thinkingOnly.code, 0, thinkingOnly.out + thinkingOnly.err);
   assert.equal(prompts[1], "real-answer", "the thinking must not be what the loop acts on");
   assert.doesNotMatch(thinkingOnly.out, /SHOULD-NOT-BE-THE-ANSWER/);
+});
+
+// The real stream sends reasoning and answer together, as fragments that only
+// their type tells apart - and the type is named once, at the start of each. Miss
+// that and the model's private thoughts are shown to the user as its reply, and a
+// fenced command inside them is run as though the model had asked for it.
+prompts.length = 0;
+messages.length = 0;
+nextId = 6;
+replies = [
+  "Understood - that is a greeting.\n\n```bash\necho GOOD-MARKER > good-marker.txt && cat good-marker.txt\n```",
+  "Done: I wrote good-marker.txt.",
+];
+renderAnswer = false;
+storeAnswers = false;
+streamShape = "reasoning";
+const reasoning = await runCli(["--cwd", project, "greet me"]);
+streamShape = "pointer";
+renderAnswer = true;
+storeAnswers = true;
+
+await test("the model's reasoning is not shown to the user as its answer", () => {
+  assert.equal(reasoning.code, 0, reasoning.out + reasoning.err);
+  assert.doesNotMatch(reasoning.out, /REASONING-SHOULD-NOT-SHOW/);
+  assert.equal(prompts[1], "GOOD-MARKER", `got: ${JSON.stringify(prompts[1])}`);
+});
+
+await test("a command that only appeared in the reasoning is not run", () => {
+  assert.ok(
+    !fs.existsSync(path.join(project, "bad-marker.txt")),
+    "a command the model was only thinking about really ran",
+  );
+  assert.ok(fs.existsSync(path.join(project, "good-marker.txt")), "the command it did ask for ran");
+});
+
+// A message that came back from the chat's own history is a list of typed
+// fragments too, and reading all of it is the same mistake by another door.
+prompts.length = 0;
+messages.length = 0;
+nextId = 6;
+replies = ["It is stored, and that is all I have to say."];
+renderAnswer = false;
+storeAnswers = true;
+storedShape = "fragments";
+streamShape = "none";
+const storedMessage = await runCli(["--cwd", project, "say what is stored"]);
+storedShape = "text";
+streamShape = "pointer";
+renderAnswer = true;
+
+await test("a stored message keeps its reasoning out of the answer", () => {
+  assert.equal(storedMessage.code, 0, storedMessage.out + storedMessage.err);
+  assert.match(storedMessage.out, /It is stored, and that is all I have to say\./);
+  assert.doesNotMatch(storedMessage.out, /STORED-REASONING-SHOULD-NOT-SHOW/);
 });
 
 prompts.length = 0;

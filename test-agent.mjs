@@ -16,6 +16,7 @@ process.env.DEEPSEEK_SHELL_TIMEOUT_MS = "1500";
 
 const { Agent, commandIn, isWslStub, paste, proseOf, resolveShell, runShell, setup, shellFor, shellName, unrunTags } =
   await import("./dist/agent.js");
+const { parseStream } = await import("./dist/browser.js");
 
 let passed = 0;
 const failures = [];
@@ -263,6 +264,68 @@ test("puts stdout before stderr", () => {
 test("does not echo the command back", () => {
   const typed = paste({ exitCode: 0, stdout: "/usr/bin", stderr: "" });
   assert.doesNotMatch(typed, /pwd/);
+});
+
+/* ------------------------------------------------------------------ */
+console.log("\n== what the model said, and what it only thought ==\n");
+/* ------------------------------------------------------------------ */
+
+// The reasoning travels in the same stream as the answer, under the same field,
+// and the site names a fragment's type once and then sends bare appends. Joining
+// all of that together is how the model's private thoughts become its reply -
+// and how a fenced command inside those thoughts becomes one that really runs.
+const stream = (...chunks) => `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}`).join("\n")}\n`;
+
+test("reads the answer and leaves the reasoning out", () => {
+  const raw = stream(
+    { p: "response/fragments", o: "APPEND", v: [{ id: 1, type: "THINK", content: "Thinking. " }] },
+    { v: [{ id: 1, content: "A command I am only thinking about:\n\n```bash\ntouch nope.txt\n```" }] },
+    { p: "response/fragments", o: "APPEND", v: [{ id: 2, type: "RESPONSE", content: "Sure. " }] },
+    { v: "Here you go.\n\n```bash\ndate\n```" },
+    { p: "response/status", v: "FINISHED" },
+  );
+  assert.equal(parseStream(raw).text, "Sure. Here you go.\n\n```bash\ndate\n```");
+});
+
+// A bare append carries no type, so it belongs to whichever fragment was named
+// last - which is exactly how most of the reasoning arrives.
+test("a bare append belongs to the fragment named last", () => {
+  const raw = stream(
+    { p: "response/fragments", v: [{ type: "THINK", content: "only thinking" }] },
+    { v: " more thinking, still not the answer" },
+  );
+  assert.equal(parseStream(raw).text, "");
+});
+
+test("stops reading the reasoning when the answer starts", () => {
+  const raw = stream(
+    { p: "response/fragments", v: [{ type: "THINK", content: "hmm" }] },
+    { v: " still hmm" },
+    { p: "response/fragments", v: [{ type: "RESPONSE", content: "the answer" }] },
+    { v: " continues" },
+  );
+  assert.equal(parseStream(raw).text, "the answer continues");
+});
+
+// A status word arrives between chunks, and it is not text - but it must not end
+// the fragment either, or the rest of the reply is thrown away.
+test("keeps reading the answer when a status interrupts it", () => {
+  const raw = stream(
+    { p: "response/status", v: "WIP" },
+    { p: "response/content", v: "Hello" },
+    { p: "response/status", v: "WIP" },
+    { v: " world" },
+  );
+  assert.equal(parseStream(raw).text, "Hello world");
+});
+
+test("still reads the older plain-text stream", () => {
+  const raw = stream(
+    { p: "response/content", v: "Hello" },
+    { v: " world" },
+    { p: "response/status", v: "FINISHED" },
+  );
+  assert.equal(parseStream(raw).text, "Hello world");
 });
 
 /* ------------------------------------------------------------------ */

@@ -135,12 +135,20 @@ fine:
 
 1. **What the page shows** — the rendered message, with its code fences put
    back. This is what a person reads, and it cannot drift out of step with the
-   site: if the answer is on screen, we have it. Reasoning is skipped, so a
-   command that was only *thought about* is never run.
+   site: if the answer is on screen, we have it.
 2. **What the chat stored** — the raw message, which is the whole answer rather
    than whatever had rendered by then.
 3. **The response body** — its streamed chunks are parsed, and this is what says
    the turn is *over*.
+
+All three have to agree about one thing: **the model's reasoning is not its
+answer.** A message on DeepSeek is a list of typed fragments — the thinking is
+one of them, the reply is another — and the stream names a fragment's type once
+and then sends appends carrying no type at all. So the type is remembered for as
+long as that fragment lasts, in both the stream and the stored message. Reading
+the fragments as one run of text shows the user the model's private thoughts, and
+worse, runs a fenced command found *inside* those thoughts as though the model
+had asked for it.
 
 This matters because a chunk shape we do not recognise parses to an empty turn,
 and an empty turn is indistinguishable from a site that said nothing. Earlier

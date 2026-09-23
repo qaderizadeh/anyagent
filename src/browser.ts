@@ -1129,30 +1129,48 @@ function bizData(text: string): Record<string, unknown> {
 }
 
 /**
- * Read the streamed reply.
+ * Whether something the stream names - a field or a fragment's type - is the
+ * answer, is not the answer, or says nothing either way.
  *
- * The payload is a pointer stream:
- *   {"p":"response/content","o":"APPEND","v":"Hello"}   append to the answer
- *   {"p":"response/status","v":"FINISHED"}              turn finished
- * `event: ready` carries the assistant message id.
+ * `null` is that third answer, and it matters. The site names a fragment's type
+ * once, at the start, and then sends bare appends carrying no name at all, so a
+ * "response/status" arriving in between must not be read as "everything after
+ * this is not the answer" - that throws the rest of the reply away.
  */
-/**
- * Whether a stream field carries the answer, as opposed to reasoning, a status
- * word or a counter. Everything is filtered by field name, because the same
- * stream also carries {"p":"response/status","v":"FINISHED"} - and appending
- * that to the answer would corrupt it.
- */
-function isAnswerField(field: string): boolean {
-  if (field === "") return true;
-  if (/think|reason|status|usage|message_id|quasi/i.test(field)) return false;
-  return /content|fragment|text|response|answer/i.test(field);
+function answerField(name: string): boolean | null {
+  if (name === "") return null;
+  if (/think|reason|search|tip/i.test(name)) return false;
+  if (/status|usage|quasi|message_id/i.test(name)) return null;
+  return true;
 }
 
-/** A {"type":"text","content":"..."} entry, as the fragment lists use. */
-function isTextFragment(item: unknown): boolean {
-  if (item === null || typeof item !== "object" || Array.isArray(item)) return false;
+/** A {"type": "THINK", "content": "..."} entry, which is what a message is made of. */
+type Fragment = { type: string; content: string };
+
+function fragmentOf(item: unknown): Fragment | null {
+  if (item === null || typeof item !== "object" || Array.isArray(item)) return null;
   const object = item as Record<string, unknown>;
-  return typeof object["content"] === "string" && typeof object["type"] === "string";
+  if (typeof object["content"] !== "string") return null;
+  return {
+    type: typeof object["type"] === "string" ? object["type"] : "",
+    content: object["content"],
+  };
+}
+
+/** Whether a fragment is the answer, rather than the model's reasoning. */
+function isAnswerFragment(fragment: Fragment): boolean {
+  return fragment.type.trim() === "" || answerField(fragment.type) !== false;
+}
+
+/**
+ * The answer inside a list of fragments, with the reasoning left out - or null
+ * when the list holds no fragments at all. Empty is a real answer here: a list
+ * of nothing but reasoning has an answer of nothing, not "show the raw JSON".
+ */
+function fragmentText(items: unknown[]): string | null {
+  const fragments = items.map(fragmentOf).filter((item): item is Fragment => item !== null);
+  if (fragments.length === 0) return null;
+  return fragments.filter(isAnswerFragment).map((fragment) => fragment.content).join("");
 }
 
 /**
@@ -1160,6 +1178,10 @@ function isTextFragment(item: unknown): boolean {
  * of fragments, a full response snapshot, or an object holding it under one of
  * its usual names. The value has taken all of these shapes over the life of the
  * site, and a shape we do not read is text silently lost.
+ *
+ * One thing is never text: a fragment the site marks as reasoning. A message is
+ * a list of typed fragments, the model's thinking is one of them, and joining
+ * them all is how its private thoughts end up looking like its answer.
  */
 function messageText(value: unknown): string {
   if (typeof value === "string") {
@@ -1168,8 +1190,9 @@ function messageText(value: unknown): string {
     if (trimmed.startsWith("[")) {
       try {
         const parsed: unknown = JSON.parse(trimmed);
-        if (Array.isArray(parsed) && parsed.length > 0 && parsed.every(isTextFragment)) {
-          return parsed.map((item) => String((item as Record<string, unknown>)["content"])).join("");
+        if (Array.isArray(parsed)) {
+          const text = fragmentText(parsed);
+          if (text !== null) return text;
         }
       } catch {
         // ordinary text that merely starts with a bracket
@@ -1177,8 +1200,15 @@ function messageText(value: unknown): string {
     }
     return value;
   }
-  if (Array.isArray(value)) return value.map(messageText).join("");
+  if (Array.isArray(value)) {
+    const text = fragmentText(value);
+    if (text !== null) return text;
+    return value.map(messageText).join("");
+  }
   if (value === null || typeof value !== "object") return "";
+
+  const fragment = fragmentOf(value);
+  if (fragment !== null && !isAnswerFragment(fragment)) return "";
 
   const object = value as Record<string, unknown>;
   for (const key of ["content", "text", "value", "answer"]) {
@@ -1194,11 +1224,29 @@ function messageText(value: unknown): string {
   return "";
 }
 
-function parseStream(raw: string): Completion {
+/**
+ * Read the streamed reply.
+ *
+ * The payload is a pointer stream:
+ *   {"p":"response/fragments","v":[{"type":"RESPONSE","content":"Hello"}]}
+ *   {"v":" more"}                        an append, with no field of its own
+ *   {"p":"response/status","v":"FINISHED"}  the turn is over
+ * `event: ready` carries the assistant message id.
+ *
+ * The reasoning travels in the very same stream, under the very same field,
+ * carrying only its fragment type to tell it apart - and the appends that
+ * follow carry no type at all. So the type is remembered, not read chunk by
+ * chunk: read the other way, the model's thinking is joined to its answer, the
+ * user is shown it, and a fenced command inside it gets run as though the model
+ * had asked for it.
+ */
+export function parseStream(raw: string): Completion {
   let text = "";
   let messageId = "";
   let event = "";
   let field = "";
+  /** Whether the fragment arriving now is the answer. */
+  let answered = true;
 
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
@@ -1238,7 +1286,17 @@ function parseStream(raw: string): Completion {
     }
     event = "";
 
-    if (typeof item["p"] === "string") field = item["p"];
+    // Whether this chunk is readable at all. A chunk that names its own field
+    // is readable only if that field is one the answer uses - a status word or
+    // a counter carries no text. A chunk with no field of its own continues
+    // whichever fragment was named last, which is how most of a reply arrives.
+    let readable = answered;
+    if (typeof item["p"] === "string") {
+      field = item["p"];
+      const says = answerField(field);
+      if (says !== null) answered = says;
+      readable = says === true;
+    }
     const value = item["v"];
 
     if (field === "response/message_id" && (typeof value === "number" || typeof value === "string")) {
@@ -1246,9 +1304,26 @@ function parseStream(raw: string): Completion {
       continue;
     }
 
-    // Reasoning, usage counters and status words travel in the same stream and
-    // are not the answer. Only the fields the answer itself uses are read.
-    if (!isAnswerField(field)) continue;
+    if (!readable) continue;
+
+    // A fragment names its type here, and that name carries over to the bare
+    // appends that follow it - which is the whole reason this is remembered.
+    const advance = (fragment: Fragment): void => {
+      if (fragment.type.trim() !== "") answered = answerField(fragment.type) !== false;
+      if (answered) text += fragment.content;
+    };
+
+    const one = fragmentOf(value);
+    if (one !== null) {
+      advance(one);
+      continue;
+    }
+    if (Array.isArray(value)) {
+      const list = value.map(fragmentOf).filter((item): item is Fragment => item !== null);
+      for (const fragment of list) advance(fragment);
+      // An array that is not a fragment list falls through to the plain reader.
+      if (list.length > 0) continue;
+    }
 
     // A whole-response snapshot replaces the answer; anything else adds to it.
     const snapshot =
@@ -1263,9 +1338,9 @@ function parseStream(raw: string): Completion {
       continue;
     }
 
-    // Fragments arrive as a list of {type:"text",content:"..."}, and plain
-    // text arrives as a string. Both are the answer; a chunk we drop is
-    // silently lost, and enough of them make the whole turn look empty.
+    // Plain text, and the older shape of the stream: skipped while the fragment
+    // being streamed is the reasoning.
+    if (!answered) continue;
     const piece = messageText(value);
     if (piece !== "") text += piece;
   }
