@@ -746,13 +746,15 @@ export class Browser {
    *
    * This is the one source that cannot drift out of step with the site: the
    * model's words are on the screen because the site put them there. Reasoning
-   * is shown in a block of its own and is skipped - it is not the answer, and
-   * picking a command out of it would run something the model only thought
-   * about.
+   * is shown in a block of its own, and that block is skipped by name - it is
+   * not the answer, and picking a command out of it would run something the
+   * model only thought about.
    */
   private async renderedAnswer(): Promise<string> {
     const text = await this.page
-      .evaluate(() => {
+      .evaluate((notTheAnswer: string) => {
+        // The list comes from this side, so the two readers cannot disagree.
+        const reasoning = new RegExp(notTheAnswer, "i");
         type Node = {
           nodeType: number;
           nodeValue?: string | null;
@@ -787,7 +789,7 @@ export class Browser {
             }
             if (child.nodeType !== 1) continue;
             const classes = classOf(child);
-            if (/think|reason/i.test(classes)) continue;
+            if (reasoning.test(classes)) continue;
             const tag = (child.tagName ?? "").toLowerCase();
             if (tag === "br") {
               out += "\n";
@@ -825,12 +827,12 @@ export class Browser {
           }
           if (found.length === 0) continue;
           const last = found[found.length - 1];
-          if (last === undefined || /think|reason/i.test(classOf(last))) continue;
+          if (last === undefined || reasoning.test(classOf(last))) continue;
           const text = render(last).replace(/\n{3,}/g, "\n\n").trim();
           if (text !== "") return text;
         }
         return "";
-      })
+      }, NOT_THE_ANSWER.source)
       .catch(() => "");
     return text.replace(/\n{3,}/g, "\n\n").trim();
   }
@@ -1129,6 +1131,17 @@ function bizData(text: string): Record<string, unknown> {
 }
 
 /**
+ * The names the site gives to the parts of a turn that are not its answer - the
+ * model's reasoning above all.
+ *
+ * One list, used by the stream reader, the stored messages and the page reader
+ * alike, so they cannot drift apart about what counts as the answer. Showing the
+ * user the model's thinking, and running a fenced command it only thought about,
+ * both start here.
+ */
+const NOT_THE_ANSWER = /think|reason|cot|analysis|chain|search|tip/i;
+
+/**
  * Whether something the stream names - a field or a fragment's type - is the
  * answer, is not the answer, or says nothing either way.
  *
@@ -1139,7 +1152,7 @@ function bizData(text: string): Record<string, unknown> {
  */
 function answerField(name: string): boolean | null {
   if (name === "") return null;
-  if (/think|reason|search|tip/i.test(name)) return false;
+  if (NOT_THE_ANSWER.test(name)) return false;
   if (/status|usage|quasi|message_id/i.test(name)) return null;
   return true;
 }

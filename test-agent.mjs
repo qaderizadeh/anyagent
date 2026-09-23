@@ -297,6 +297,32 @@ test("a bare append belongs to the fragment named last", () => {
   assert.equal(parseStream(raw).text, "");
 });
 
+// The site has spelled this more than one way over time, and every spelling we
+// miss is the model's thinking shown to the user - or run as a command.
+test("knows the reasoning by every name it goes by", () => {
+  for (const type of ["THINK", "thinking", "REASONING", "cot", "analysis", "CHAIN_OF_THOUGHT", "search"]) {
+    const raw = stream(
+      { p: "response/fragments", v: [{ type, content: "NOT the answer" }] },
+      { v: " still not the answer" },
+    );
+    assert.equal(parseStream(raw).text, "", type);
+  }
+});
+
+test("knows the reasoning by a field name too", () => {
+  for (const field of ["response/thinking_content", "response/reasoning", "response/cot"]) {
+    const raw = stream({ p: field, v: "NOT the answer" }, { v: " still not" });
+    assert.equal(parseStream(raw).text, "", field);
+  }
+});
+
+test("reads the answer whatever name the answer goes by", () => {
+  for (const type of ["RESPONSE", "text", "TEXT", "answer", ""]) {
+    const raw = stream({ p: "response/fragments", v: [{ type, content: "the answer" }] });
+    assert.equal(parseStream(raw).text, "the answer", type || "(no type at all)");
+  }
+});
+
 test("stops reading the reasoning when the answer starts", () => {
   const raw = stream(
     { p: "response/fragments", v: [{ type: "THINK", content: "hmm" }] },

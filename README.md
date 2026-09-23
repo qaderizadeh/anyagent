@@ -228,7 +228,7 @@ session alive, so the model sees what failed and can try something else.
 | `ANYAGENT_PACE_MS` | `300` | pause before each prompt |
 | `ANYAGENT_ANSWER_TIMEOUT_MS` | `180000` | how long to wait for the answer to appear |
 | `ANYAGENT_SHELL` | a real bash, else `cmd.exe` on Windows | shell the commands run in (must take `-c`, or be `cmd.exe`) |
-| `DEEPSEEK_THINKING_ENABLED` | on | deep thinking, per message |
+| `DEEPSEEK_THINKING_ENABLED` | on | deep thinking, per message — you never see the thinking; `0` turns it off entirely |
 | `DEEPSEEK_SEARCH_ENABLED` | off | web search, per message |
 | `DEEPSEEK_MAX_ITERATIONS` | `50` | loop limit |
 | `DEEPSEEK_SHELL_TIMEOUT_MS` | `120000` | command timeout |

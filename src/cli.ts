@@ -46,7 +46,7 @@ Env:
   ANYAGENT_BROWSER_PATH      pick a browser by hand, whatever its name
   ANYAGENT_PACE_MS           pause before each prompt (default: 300)
   ANYAGENT_SHELL             shell the commands run in (default: a real bash, cmd.exe on Windows)
-  DEEPSEEK_THINKING_ENABLED  deep thinking (default: on)
+  DEEPSEEK_THINKING_ENABLED  deep thinking, never shown to you (default: on; 0 = off)
   DEEPSEEK_SEARCH_ENABLED    web search (default: off)
   DEEPSEEK_MAX_ITERATIONS    loop limit (default: 50)
   DEEPSEEK_SHELL_TIMEOUT_MS  command timeout (default: 120000)`;
