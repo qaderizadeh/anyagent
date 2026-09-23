@@ -640,10 +640,12 @@ export class Browser {
     let stalledAt = 0;
     while (Date.now() < deadline) {
       // The response is in and readable: that is this turn.
-      if (turn.answer !== null) {
-        const stored = await this.storedAnswer(beforeId);
-        return stored ?? turn.answer;
-      }
+      //
+      // The stream is the one reading that knows which channel every byte
+      // arrived on - the answer from the reasoning - so when it has something to
+      // say it is what is used. The chat's own copy is the fallback, not the
+      // first choice, because it is one string with the two run together.
+      if (turn.answer !== null) return turn.answer;
 
       const now = await this.renderedAnswer();
       // Something new is on the page. It is finished when it stops changing.
@@ -659,7 +661,9 @@ export class Browser {
       }
 
       poll += 1;
-      if (poll % HISTORY_EVERY === 0) {
+      // What the chat stored - but only once the response is over and carried
+      // nothing, so it can never displace what the stream said.
+      if (poll % HISTORY_EVERY === 0 && turn.done && turn.answer === null) {
         const stored = await this.storedAnswer(beforeId);
         if (stored !== null) return stored;
       }
@@ -723,22 +727,53 @@ export class Browser {
 
     const status = started.status();
     const { raw, error } = await this.readBody(started);
+
+    let reply: Completion | null = null;
+    let refusal: string | null = null;
     try {
-      const reply = raw === "" ? null : parseStream(raw);
-      if (reply !== null && reply.text.trim() !== "") {
-        if (reply.messageId) this.lastSeenId = Number(reply.messageId) || this.lastSeenId;
-        return { answer: reply, problem: null, status, raw };
-      }
+      reply = raw === "" ? null : parseStream(raw);
     } catch (thrown) {
       // A refusal inside the stream: DeepSeek said why, so keep that.
-      return {
-        answer: null,
-        problem: thrown instanceof Error ? thrown.message : String(thrown),
-        status,
-        raw,
-      };
+      refusal = thrown instanceof Error ? thrown.message : String(thrown);
+    }
+    this.dumpTurn(status, raw, reply?.text ?? null);
+
+    if (refusal !== null) return { answer: null, problem: refusal, status, raw };
+    if (reply !== null && reply.text.trim() !== "") {
+      if (reply.messageId) this.lastSeenId = Number(reply.messageId) || this.lastSeenId;
+      return { answer: reply, problem: null, status, raw };
     }
     return { answer: null, problem: noAnswer(status, raw, error), status, raw };
+  }
+
+  /**
+   * Keep the bytes of this turn when ANYAGENT_DEBUG is on.
+   *
+   * Every fault this transport has had was a misreading of the stream, and a
+   * stream cannot be argued with - only looked at. One file, overwritten each
+   * turn, so what is in it is always the turn that just happened.
+   */
+  private dumpTurn(status: number, raw: string, reply: string | null): void {
+    if (!boolEnv("ANYAGENT_DEBUG", false)) return;
+    const file = path.join(profileDir(), "last-turn.txt");
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(
+        file,
+        [
+          `when: ${new Date().toISOString()}`,
+          `url: ${this.page.url()}`,
+          `status: ${status}`,
+          `read back: ${reply === null ? "(nothing)" : JSON.stringify(reply.slice(0, 2000))}`,
+          "",
+          "--- response body ---",
+          raw,
+        ].join("\n"),
+      );
+      process.stdout.write(`  (debug: this turn's response is in ${file})\n`);
+    } catch {
+      // a dump that cannot be written must not cost us the turn
+    }
   }
 
   /**
@@ -1131,30 +1166,52 @@ function bizData(text: string): Record<string, unknown> {
 }
 
 /**
- * The names the site gives to the parts of a turn that are not its answer - the
- * model's reasoning above all.
+ * The names the site gives to the parts of a turn that are not its answer.
  *
- * One list, used by the stream reader, the stored messages and the page reader
- * alike, so they cannot drift apart about what counts as the answer. Showing the
- * user the model's thinking, and running a fenced command it only thought about,
- * both start here.
+ * This one is for class names on the page - the block the thinking is rendered
+ * in - and is the only place a loose match is safe: a name we do not recognise
+ * there loses the answer, so it is used to *skip* what is clearly not the
+ * answer rather than to decide what is.
  */
 const NOT_THE_ANSWER = /think|reason|cot|analysis|chain|search|tip/i;
 
 /**
- * Whether something the stream names - a field or a fragment's type - is the
- * answer, is not the answer, or says nothing either way.
- *
- * `null` is that third answer, and it matters. The site names a fragment's type
- * once, at the start, and then sends bare appends carrying no name at all, so a
- * "response/status" arriving in between must not be read as "everything after
- * this is not the answer" - that throws the rest of the reply away.
+ * The two channels a turn arrives on. There is no third: everything the site
+ * sends is either what the model is saying or what it is thinking.
  */
-function answerField(name: string): boolean | null {
+type Channel = "answer" | "reasoning";
+
+/**
+ * The channel a fragment's type names, or null when it names nothing we know.
+ *
+ * The site's types are `THINK` and `RESPONSE` (and `SEARCH`), and this is a
+ * whitelist on purpose. Guessing that an unfamiliar name is the answer is how
+ * the reasoning gets read as the reply - and how a fenced command inside it gets
+ * run. An unfamiliar name therefore carries no text at all: the answer is lost,
+ * which is visible and fixable, rather than the thinking being shown, which is
+ * neither.
+ */
+function typeChannel(type: string): Channel | null {
+  const name = type.trim().toUpperCase();
   if (name === "") return null;
-  if (NOT_THE_ANSWER.test(name)) return false;
-  if (/status|usage|quasi|message_id/i.test(name)) return null;
-  return true;
+  if (name === "RESPONSE" || name === "TEXT" || name === "ANSWER") return "answer";
+  if (name.startsWith("THINK") || name.startsWith("REASON") || name.startsWith("COT")) return "reasoning";
+  if (name.startsWith("SEARCH")) return "reasoning";
+  return null;
+}
+
+/**
+ * The channel a stream field names, or null when it names neither.
+ *
+ * Matched on the last path segment, not on the whole path, because every field
+ * begins with "response" - a loose match would read `response/status` as the
+ * answer and append the word FINISHED to it.
+ */
+function fieldChannel(field: string): Channel | null {
+  const leaf = (field.toLowerCase().split("/").pop() ?? "").trim();
+  if (leaf === "content" || leaf === "text" || leaf === "answer") return "answer";
+  if (leaf.startsWith("think") || leaf.startsWith("reason") || leaf.startsWith("cot")) return "reasoning";
+  return null;
 }
 
 /** A {"type": "THINK", "content": "..."} entry, which is what a message is made of. */
@@ -1170,20 +1227,18 @@ function fragmentOf(item: unknown): Fragment | null {
   };
 }
 
-/** Whether a fragment is the answer, rather than the model's reasoning. */
-function isAnswerFragment(fragment: Fragment): boolean {
-  return fragment.type.trim() === "" || answerField(fragment.type) !== false;
-}
-
 /**
- * The answer inside a list of fragments, with the reasoning left out - or null
- * when the list holds no fragments at all. Empty is a real answer here: a list
- * of nothing but reasoning has an answer of nothing, not "show the raw JSON".
+ * The answer inside a list of fragments - or null when the list holds no
+ * fragments at all. Empty is a real answer here: a list of nothing but reasoning
+ * has an answer of nothing, not "show the raw JSON".
  */
 function fragmentText(items: unknown[]): string | null {
   const fragments = items.map(fragmentOf).filter((item): item is Fragment => item !== null);
   if (fragments.length === 0) return null;
-  return fragments.filter(isAnswerFragment).map((fragment) => fragment.content).join("");
+  return fragments
+    .filter((fragment) => typeChannel(fragment.type) === "answer")
+    .map((fragment) => fragment.content)
+    .join("");
 }
 
 /**
@@ -1221,7 +1276,7 @@ function messageText(value: unknown): string {
   if (value === null || typeof value !== "object") return "";
 
   const fragment = fragmentOf(value);
-  if (fragment !== null && !isAnswerFragment(fragment)) return "";
+  if (fragment !== null && typeChannel(fragment.type) !== "answer") return "";
 
   const object = value as Record<string, unknown>;
   for (const key of ["content", "text", "value", "answer"]) {
@@ -1242,24 +1297,35 @@ function messageText(value: unknown): string {
  *
  * The payload is a pointer stream:
  *   {"p":"response/fragments","v":[{"type":"RESPONSE","content":"Hello"}]}
- *   {"v":" more"}                        an append, with no field of its own
- *   {"p":"response/status","v":"FINISHED"}  the turn is over
+ *   {"v":{"response":{"fragments":[...]}}}       the whole response so far
+ *   {"p":"response/fragments/-1/content","v":" more"}  append to the last one
+ *   {"v":" more"}                                the same, with no field at all
+ *   {"p":"response/status","v":"FINISHED"}        the turn is over
  * `event: ready` carries the assistant message id.
  *
- * The reasoning travels in the very same stream, under the very same field,
- * carrying only its fragment type to tell it apart - and the appends that
- * follow carry no type at all. So the type is remembered, not read chunk by
- * chunk: read the other way, the model's thinking is joined to its answer, the
- * user is shown it, and a fenced command inside it gets run as though the model
- * had asked for it.
+ * The reasoning travels in this very stream, under the very same field. What
+ * tells them apart is the fragment type, named once - `THINK` for the thinking,
+ * `RESPONSE` for the reply - and then a run of appends that name nothing at all.
+ * So the channel is *carried*, never re-derived per chunk: a chunk's field
+ * cannot say which of the two it belongs to, because both use the same one.
+ *
+ * Reading it any other way joins the model's thinking to its answer, shows the
+ * user its private thoughts, and runs a fenced command found inside them as
+ * though the model had asked for it.
  */
 export function parseStream(raw: string): Completion {
   let text = "";
   let messageId = "";
   let event = "";
-  let field = "";
-  /** Whether the fragment arriving now is the answer. */
-  let answered = true;
+  /**
+   * Which fragment is being streamed.
+   *
+   * It starts as the reasoning, not the answer. The site sends the thinking
+   * first, and anything that arrives before a fragment has said it is the
+   * answer is the thinking - so the reply is built from what has *declared*
+   * itself, never from what has not.
+   */
+  let channel: Channel = "reasoning";
 
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
@@ -1294,68 +1360,79 @@ export function parseStream(raw: string): Completion {
       );
     }
 
-    if (event === "ready" && item["response_message_id"] != null) {
-      messageId = String(item["response_message_id"]);
+    if (event === "ready") {
+      const id = item["response_message_id"] ?? item["request_message_id"];
+      if (id != null) messageId = String(id);
     }
     event = "";
 
-    // Whether this chunk is readable at all. A chunk that names its own field
-    // is readable only if that field is one the answer uses - a status word or
-    // a counter carries no text. A chunk with no field of its own continues
-    // whichever fragment was named last, which is how most of a reply arrives.
-    let readable = answered;
-    if (typeof item["p"] === "string") {
-      field = item["p"];
-      const says = answerField(field);
-      if (says !== null) answered = says;
-      readable = says === true;
-    }
+    const path = typeof item["p"] === "string" ? item["p"] : "";
+    const op = typeof item["o"] === "string" ? item["o"] : "";
     const value = item["v"];
 
-    if (field === "response/message_id" && (typeof value === "number" || typeof value === "string")) {
-      messageId = String(value);
-      continue;
-    }
-
-    if (!readable) continue;
-
-    // A fragment names its type here, and that name carries over to the bare
-    // appends that follow it - which is the whole reason this is remembered.
-    const advance = (fragment: Fragment): void => {
-      if (fragment.type.trim() !== "") answered = answerField(fragment.type) !== false;
-      if (answered) text += fragment.content;
+    /** Read a list of fragments: each one's type sets the channel. */
+    const readFragments = (list: unknown): boolean => {
+      if (!Array.isArray(list)) return false;
+      let seen = false;
+      for (const entry of list) {
+        const fragment = fragmentOf(entry);
+        // An entry whose type we do not know carries no text *and* leaves the
+        // channel alone - it is not the answer and not a reason to change what
+        // is being streamed.
+        if (fragment === null) continue;
+        const named = typeChannel(fragment.type);
+        if (named === null) continue;
+        seen = true;
+        channel = named;
+        if (named === "answer") text += fragment.content;
+      }
+      return seen;
     };
 
-    const one = fragmentOf(value);
-    if (one !== null) {
-      advance(one);
-      continue;
-    }
-    if (Array.isArray(value)) {
-      const list = value.map(fragmentOf).filter((item): item is Fragment => item !== null);
-      for (const fragment of list) advance(fragment);
-      // An array that is not a fragment list falls through to the plain reader.
-      if (list.length > 0) continue;
-    }
-
-    // A whole-response snapshot replaces the answer; anything else adds to it.
+    // A whole-response snapshot, wrapped around the fragments it is built from.
     const snapshot =
       value !== null && typeof value === "object" && !Array.isArray(value)
         ? (value as Record<string, unknown>)["response"]
         : null;
-    if (snapshot !== null && typeof snapshot === "object") {
+    if (snapshot !== null && typeof snapshot === "object" && !Array.isArray(snapshot)) {
       const whole = snapshot as Record<string, unknown>;
-      const full = messageText(whole["content"]);
-      if (full !== "") text = full;
+      readFragments(whole["fragments"]);
       if (whole["message_id"] != null) messageId = String(whole["message_id"]);
       continue;
     }
 
-    // Plain text, and the older shape of the stream: skipped while the fragment
-    // being streamed is the reasoning.
-    if (!answered) continue;
-    const piece = messageText(value);
-    if (piece !== "") text += piece;
+    // A fragment list: the only thing that can set the channel.
+    if (Array.isArray(value)) {
+      if (readFragments(value)) continue;
+    }
+
+    // A message id is not text, whatever field it arrives under.
+    if (/message_id/i.test(path) && (typeof value === "number" || typeof value === "string")) {
+      messageId = String(value);
+      continue;
+    }
+
+    // An append with no type of its own: it belongs to the fragment being
+    // streamed, whichever that is. `response/fragments/-1/content` means "the
+    // content of the last fragment", whatever id that fragment happens to be.
+    const appends =
+      /^response\/fragments\/[^/]*\/content$/.test(path) ||
+      (path === "" && op === "APPEND" && value !== undefined) ||
+      (path === "" && op === "" && typeof value === "string");
+    if (appends) {
+      const piece = typeof value === "string" ? value : "";
+      if (channel === "answer") text += piece;
+      continue;
+    }
+
+    // A field that names a channel outright - `response/content` is the answer,
+    // `response/thinking_content` is not. Anything else says nothing and is left
+    // alone rather than guessed at.
+    const named = path === "" ? null : fieldChannel(path);
+    if (named === null) continue;
+    channel = named;
+    const piece = typeof value === "string" ? value : messageText(value);
+    if (named === "answer") text += piece;
   }
 
   return { text, messageId: messageId || undefined };

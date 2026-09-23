@@ -25,6 +25,23 @@ import { Browser, modes, type ChatSession } from "./browser.js";
 const dim = (text: string): string => (process.stdout.isTTY ? `\x1b[2m${text}\x1b[0m` : text);
 const bold = (text: string): string => (process.stdout.isTTY ? `\x1b[1m${text}\x1b[0m` : text);
 
+/**
+ * The version, read from package.json beside the build.
+ *
+ * It is printed in the banner so a report of "it still does X" can be tied to
+ * the build that did it - an unpulled checkout and a stale dist look exactly
+ * like a fix that did not work.
+ */
+const VERSION = ((): string => {
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    const version = (parsed as { version?: unknown }).version;
+    return typeof version === "string" ? version : "";
+  } catch {
+    return "";
+  }
+})();
+
 const HELP = `Commands:
   /help       show this
   /sessions   list DeepSeek sessions and switch
@@ -45,6 +62,7 @@ Env:
   ANYAGENT_BROWSER           edge | chrome | chromium | bundled (default: Edge, then Chrome, then Chromium)
   ANYAGENT_BROWSER_PATH      pick a browser by hand, whatever its name
   ANYAGENT_PACE_MS           pause before each prompt (default: 300)
+  ANYAGENT_DEBUG             1 to keep each turn's raw response in the profile dir
   ANYAGENT_SHELL             shell the commands run in (default: a real bash, cmd.exe on Windows)
   DEEPSEEK_THINKING_ENABLED  deep thinking, never shown to you (default: on; 0 = off)
   DEEPSEEK_SEARCH_ENABLED    web search (default: off)
@@ -186,7 +204,7 @@ async function run(args: Args, browser: Browser, cwd: string): Promise<void> {
   }
 
   const { thinking, search } = modes();
-  console.log(bold("AnyAgent"));
+  console.log(bold("AnyAgent") + (VERSION === "" ? "" : dim(` ${VERSION}`)));
   console.log("────────────────────────────");
   console.log(`${dim("Backend:  ")} chat.deepseek.com (${browser.mode})`);
   console.log(`${dim("Login:    ")} ${browser.login}`);

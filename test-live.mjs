@@ -287,19 +287,22 @@ const server = https.createServer({ key: fs.readFileSync(key), cert: fs.readFile
         return;
       }
 
-      // The shape the live site actually sends: the reasoning and the answer in
-      // one fragment stream, each fragment's type named once and then followed
-      // by bare appends that carry no type at all.
+      // The shape the live site actually sends: typed fragments - THINK for the
+      // thinking, RESPONSE for the reply - each named once, then streamed to the
+      // end as `response/fragments/-1/content` appends carrying no type at all.
+      // Both channels use that same append field, which is what makes a client
+      // that decides the channel per chunk read the thinking as the answer.
       if (streamShape === "reasoning") {
         const half = Math.ceil(reply.length / 2);
+        const append = { p: "response/fragments/-1/content", o: "APPEND" };
         res.end(
           [
             "event: ready",
             `data: ${JSON.stringify({ response_message_id: String(100 + index) })}`,
             `data: ${JSON.stringify({ p: "response/fragments", o: "APPEND", v: [{ id: 1, type: "THINK", content: "REASONING-SHOULD-NOT-SHOW " }] })}`,
-            `data: ${JSON.stringify({ v: [{ id: 1, content: "and a command I am only thinking about:\n\n```bash\necho bad > bad-marker.txt\n```" }] })}`,
+            `data: ${JSON.stringify({ ...append, v: "and a command I am only thinking about:\n\n```bash\necho bad > bad-marker.txt\n```" })}`,
             `data: ${JSON.stringify({ p: "response/fragments", o: "APPEND", v: [{ id: 2, type: "RESPONSE", content: reply.slice(0, half) }] })}`,
-            `data: ${JSON.stringify({ v: reply.slice(half) })}`,
+            `data: ${JSON.stringify({ ...append, v: reply.slice(half) })}`,
             `data: ${JSON.stringify({ p: "response/status", v: "FINISHED" })}`,
             "",
           ].join("\n"),

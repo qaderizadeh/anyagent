@@ -270,85 +270,131 @@ test("does not echo the command back", () => {
 console.log("\n== what the model said, and what it only thought ==\n");
 /* ------------------------------------------------------------------ */
 
-// The reasoning travels in the same stream as the answer, under the same field,
-// and the site names a fragment's type once and then sends bare appends. Joining
-// all of that together is how the model's private thoughts become its reply -
-// and how a fenced command inside those thoughts becomes one that really runs.
+// A message is a list of typed fragments - THINK for the thinking, RESPONSE for
+// the reply - and the site names the type once, then streams the rest of that
+// fragment as appends that name nothing at all. The appends use the *same*
+// field for both channels, so the channel has to be carried, never re-derived
+// from the chunk in front of you. Getting that wrong is the model's private
+// thoughts shown to the user as its reply, and a fenced command inside them run.
 const stream = (...chunks) => `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}`).join("\n")}\n`;
+
+/** The site's own way of appending to the fragment being streamed. */
+const append = (body) => ({ p: "response/fragments/-1/content", o: "APPEND", v: body });
+
+const thinking = (content) => ({ p: "response/fragments", o: "APPEND", v: [{ id: 1, type: "THINK", content }] });
+const answering = (content) => ({ p: "response/fragments", o: "APPEND", v: [{ id: 2, type: "RESPONSE", content }] });
 
 test("reads the answer and leaves the reasoning out", () => {
   const raw = stream(
-    { p: "response/fragments", o: "APPEND", v: [{ id: 1, type: "THINK", content: "Thinking. " }] },
-    { v: [{ id: 1, content: "A command I am only thinking about:\n\n```bash\ntouch nope.txt\n```" }] },
-    { p: "response/fragments", o: "APPEND", v: [{ id: 2, type: "RESPONSE", content: "Sure. " }] },
-    { v: "Here you go.\n\n```bash\ndate\n```" },
+    thinking("Thinking. "),
+    append("A command I am only thinking about:\n\n```bash\ntouch nope.txt\n```"),
+    answering("Sure. "),
+    append("Here you go.\n\n```bash\ndate\n```"),
     { p: "response/status", v: "FINISHED" },
   );
   assert.equal(parseStream(raw).text, "Sure. Here you go.\n\n```bash\ndate\n```");
 });
 
-// A bare append carries no type, so it belongs to whichever fragment was named
-// last - which is exactly how most of the reasoning arrives.
-test("a bare append belongs to the fragment named last", () => {
-  const raw = stream(
-    { p: "response/fragments", v: [{ type: "THINK", content: "only thinking" }] },
-    { v: " more thinking, still not the answer" },
-  );
+// The appends that follow a fragment carry no type, so they belong to it.
+// These are what a client that re-reads the channel per chunk gets wrong, and
+// they are where most of the reasoning actually arrives.
+test("an append belongs to the fragment it follows", () => {
+  const raw = stream(thinking("only thinking"), append(" and more of it"), { v: " and more" });
   assert.equal(parseStream(raw).text, "");
 });
 
-// The site has spelled this more than one way over time, and every spelling we
-// miss is the model's thinking shown to the user - or run as a command.
+test("the same append is the answer when the answer came first", () => {
+  const raw = stream(answering("the answer"), append(" continues"), { v: " and continues" });
+  assert.equal(parseStream(raw).text, "the answer continues and continues");
+});
+
+test("switches channel when the answer starts mid-stream", () => {
+  const raw = stream(thinking("hmm"), append(" still hmm"), answering("the answer"), append(" continues"));
+  assert.equal(parseStream(raw).text, "the answer continues");
+});
+
+// Before anything has said it is the answer, it is the thinking - so a stream
+// that opens with an append cannot leak one.
+test("an append before any fragment is not the answer", () => {
+  const raw = stream(append("reasoning with no fragment named yet"), answering("the answer"));
+  assert.equal(parseStream(raw).text, "the answer");
+});
+
 test("knows the reasoning by every name it goes by", () => {
-  for (const type of ["THINK", "thinking", "REASONING", "cot", "analysis", "CHAIN_OF_THOUGHT", "search"]) {
+  for (const type of ["THINK", "thinking", "REASONING", "cot", "SEARCH", "SEARCH_REF"]) {
     const raw = stream(
       { p: "response/fragments", v: [{ type, content: "NOT the answer" }] },
-      { v: " still not the answer" },
+      append(" still not the answer"),
     );
     assert.equal(parseStream(raw).text, "", type);
   }
 });
 
+// A type we have never seen carries nothing at all, and does not move the
+// channel either. Losing the answer is visible; showing the thinking is not.
+test("an unknown fragment type carries no text", () => {
+  const raw = stream(
+    { p: "response/fragments", v: [{ type: "SOMETHING_NEW", content: "not shown" }] },
+    append(" nowhere"),
+    answering("the answer"),
+  );
+  assert.equal(parseStream(raw).text, "the answer");
+});
+
+test("a fragment with no type carries no text", () => {
+  const raw = stream(
+    { p: "response/fragments", v: [{ id: 1, content: "not shown" }] },
+    append(" nowhere"),
+  );
+  assert.equal(parseStream(raw).text, "");
+});
+
+test("reads the answer whatever name the answer goes by", () => {
+  for (const type of ["RESPONSE", "text", "TEXT", "answer"]) {
+    const raw = stream({ p: "response/fragments", v: [{ type, content: "the answer" }] });
+    assert.equal(parseStream(raw).text, "the answer", type);
+  }
+});
+
 test("knows the reasoning by a field name too", () => {
   for (const field of ["response/thinking_content", "response/reasoning", "response/cot"]) {
-    const raw = stream({ p: field, v: "NOT the answer" }, { v: " still not" });
+    const raw = stream({ p: field, v: "NOT the answer" }, append(" still not"));
     assert.equal(parseStream(raw).text, "", field);
   }
 });
 
-test("reads the answer whatever name the answer goes by", () => {
-  for (const type of ["RESPONSE", "text", "TEXT", "answer", ""]) {
-    const raw = stream({ p: "response/fragments", v: [{ type, content: "the answer" }] });
-    assert.equal(parseStream(raw).text, "the answer", type || "(no type at all)");
-  }
-});
-
-test("stops reading the reasoning when the answer starts", () => {
-  const raw = stream(
-    { p: "response/fragments", v: [{ type: "THINK", content: "hmm" }] },
-    { v: " still hmm" },
-    { p: "response/fragments", v: [{ type: "RESPONSE", content: "the answer" }] },
-    { v: " continues" },
-  );
-  assert.equal(parseStream(raw).text, "the answer continues");
-});
-
-// A status word arrives between chunks, and it is not text - but it must not end
-// the fragment either, or the rest of the reply is thrown away.
+// A status word is not text, and must not end the fragment either - or the rest
+// of the answer is thrown away.
 test("keeps reading the answer when a status interrupts it", () => {
   const raw = stream(
     { p: "response/status", v: "WIP" },
     { p: "response/content", v: "Hello" },
-    { p: "response/status", v: "WIP" },
-    { v: " world" },
+    { p: "response/status", v: "FINISHED" },
+    append(" world"),
   );
   assert.equal(parseStream(raw).text, "Hello world");
+});
+
+test("a status word is never text", () => {
+  const raw = stream(answering("Hello"), { p: "response/status", v: "FINISHED" });
+  assert.equal(parseStream(raw).text, "Hello");
+});
+
+test("reads a whole-response snapshot", () => {
+  const raw = stream({
+    v: {
+      response: {
+        fragments: [{ type: "THINK", content: "hidden" }, { type: "RESPONSE", content: "the answer" }],
+      },
+    },
+  });
+  assert.equal(parseStream(raw).text, "the answer");
 });
 
 test("still reads the older plain-text stream", () => {
   const raw = stream(
     { p: "response/content", v: "Hello" },
-    { v: " world" },
+    append(" world"),
     { p: "response/status", v: "FINISHED" },
   );
   assert.equal(parseStream(raw).text, "Hello world");

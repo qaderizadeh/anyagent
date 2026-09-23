@@ -142,13 +142,26 @@ fine:
    the turn is *over*.
 
 All three have to agree about one thing: **the model's reasoning is not its
-answer.** A message on DeepSeek is a list of typed fragments — the thinking is
-one of them, the reply is another — and the stream names a fragment's type once
-and then sends appends carrying no type at all. So the type is remembered for as
-long as that fragment lasts, in both the stream and the stored message. Reading
-the fragments as one run of text shows the user the model's private thoughts, and
-worse, runs a fenced command found *inside* those thoughts as though the model
-had asked for it.
+answer.** A message on DeepSeek is a list of typed fragments — `THINK` for the
+thinking, `RESPONSE` for the reply — and the site names a fragment's type once,
+then streams the rest of that fragment as appends that name nothing at all:
+
+```text
+data: {"p":"response/fragments","o":"APPEND","v":[{"id":2,"type":"RESPONSE","content":"Sure. "}]}
+data: {"p":"response/fragments/-1/content","o":"APPEND","v":"Here you go."}
+```
+
+Both channels use that same append field, so **the channel is carried, never
+re-derived from the chunk in front of you** — and it begins as the reasoning, so
+anything that has not declared itself the answer is the thinking. A fragment type
+we do not recognise carries no text at all rather than being guessed to be the
+answer: losing the reply is visible and gets fixed, showing the thinking is
+neither.
+
+Getting this wrong shows you the model's private thoughts as its reply, and runs
+a fenced command found *inside* those thoughts as though the model had asked for
+it. That is not hypothetical — it is what this did before, so there is a test for
+each half of it, and both fail against the old parser.
 
 This matters because a chunk shape we do not recognise parses to an empty turn,
 and an empty turn is indistinguishable from a site that said nothing. Earlier
@@ -226,6 +239,7 @@ session alive, so the model sees what failed and can try something else.
 | `ANYAGENT_BROWSER_PATH` | — | use a specific browser instead of the one found |
 | `ANYAGENT_PROFILE_DIR` | `~/.anyagent/browser` | where the browser profile lives |
 | `ANYAGENT_PACE_MS` | `300` | pause before each prompt |
+| `ANYAGENT_DEBUG` | off | keep each turn's raw response in the profile dir |
 | `ANYAGENT_ANSWER_TIMEOUT_MS` | `180000` | how long to wait for the answer to appear |
 | `ANYAGENT_SHELL` | a real bash, else `cmd.exe` on Windows | shell the commands run in (must take `-c`, or be `cmd.exe`) |
 | `DEEPSEEK_THINKING_ENABLED` | on | deep thinking, per message — you never see the thinking; `0` turns it off entirely |
