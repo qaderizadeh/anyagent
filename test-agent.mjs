@@ -178,6 +178,55 @@ try {
 check("an error inside the stream is raised, not read as an empty reply", threw instanceof BizError && threw.code === 40003);
 
 /* ------------------------------------------------------------------ */
+/* a hint: the backend saying it will not answer                       */
+/* ------------------------------------------------------------------ */
+
+/** Feed whole SSE lines, exactly as they come off the wire. */
+const lines = (...lines) => {
+  const reader = createStreamReader();
+  for (const line of lines) reader.feed(line);
+  return reader;
+};
+
+// This is what "the agent stops answering after a few messages" looks like: the
+// chat is fine, the model never spoke, and the only explanation is in the hint.
+const throttled = lines(
+  "event: ready",
+  'data: {"request_message_id": 1, "response_message_id": 2}',
+  "",
+  "event: hint",
+  'data: {"type":"error","content":"Messages too frequent. Try again later.","clear_response":true,"finish_reason":"rate_limit_reached"}',
+  "",
+  "event: close",
+  'data: {"click_behavior":"retry","auto_resume":false}',
+);
+check("a rate limit is read instead of swallowed", throttled.refusal()?.message === "Messages too frequent. Try again later.");
+check("a rate limit says to wait and send it again", throttled.refusal()?.pause === true);
+check("a rate limit is not an answer", throttled.text() === "");
+check("the hint's own text is not taken as the reply", !throttled.text().includes("too frequent"));
+
+const wall = lines(
+  "event: hint",
+  'data: {"type":"error","content":"Content cannot be processed.","finish_reason":"content_filter"}',
+);
+check("a refusal with no waiting to do is still reported", wall.refusal()?.message === "Content cannot be processed.");
+check("a refusal that waiting cannot fix is not retried", wall.refusal()?.pause === false);
+
+const chatter = lines(
+  "event: hint",
+  'data: {"type":"hint","content":"Search is available."}',
+  '',
+  'data: {"p":"response/content","o":"APPEND","v":"the answer"}',
+);
+check("an informational hint changes nothing", chatter.refusal() === null && chatter.text() === "the answer");
+check("a stream that just ends has no refusal", read([{ p: "response/content", v: "hi" }]).text === "hi");
+check("refusal() is null on a stream that never refused", theReaderRefusal());
+
+function theReaderRefusal() {
+  return createStreamReader().refusal() === null;
+}
+
+/* ------------------------------------------------------------------ */
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

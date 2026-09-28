@@ -10,7 +10,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { BizError, complete, createSession, type Completion, type Session } from "./deepseek.js";
+import { BizError, complete, createSession, SlowDown, type Completion, type Session } from "./deepseek.js";
 
 /**
  * Said once, as the first message of a chat. It is the whole protocol.
@@ -26,6 +26,12 @@ const MAX_OUTPUT = 30_000;
 /** Attempts allowed for a reply that came back empty. */
 const MAX_EMPTY = 3;
 const RETRY_DELAY_MS = 2_000;
+/** Times a reply may arrive as raw tool-call markup before it is just printed. */
+const MAX_NAGS = 2;
+/** How patient to be with "too frequent": the browser shows Retry, this waits. */
+const MAX_WAITS = intEnv("DEEPSEEK_MAX_WAITS", 8);
+const WAIT_MS = intEnv("DEEPSEEK_RETRY_WAIT_MS", 10_000);
+const MAX_WAIT_MS = 60_000;
 
 const IS_WINDOWS = process.platform === "win32";
 
@@ -67,6 +73,19 @@ export const searchEnabled = (): boolean => boolEnv("DEEPSEEK_SEARCH_ENABLED", f
  * a command in it. Group 1 is the tag, group 2 the body.
  */
 const FENCE = /```([^\n`]*)\r?\n([\s\S]*?)(?:```|$)/g;
+
+/**
+ * The backend offers the model tools of its own, and every so often it reaches
+ * for one: the call arrives in the reply as plain text instead of a ```sh
+ * block. It is not a command, and it is not an answer either - printing it gets
+ * you a wall of markup and the task stalls - so the format is asked for again.
+ */
+const RAW_CALL = /\uff5c\uff5cDSML\uff5c\uff5c/;
+
+const PROTOCOL_NAG =
+  "That came through as raw tool-call markup, which is not something I can run. Please answer " +
+  "in the format we agreed: at most one ```sh block holding a single command, or a plain reply " +
+  "with no block at all.";
 
 /** Tags that are a snippet, not something to type into a shell. */
 const NOT_A_COMMAND = new Set([
@@ -209,6 +228,8 @@ export type AgentEvents = {
   onComment?: (text: string) => void;
   /** The backend lost the chat, so a fresh one was started. */
   onNewSession?: (chatId: string) => void;
+  /** The backend asked for a pause, so the same prompt is sent again later. */
+  onWait?: (message: string, ms: number) => void;
 };
 
 export class Agent {
@@ -241,9 +262,28 @@ export class Agent {
     let prompt = this.introduced ? task : `${STARTER}\n\n${task}`;
     this.introduced = true;
     let empty = 0;
+    let step = 0;
+    let waits = 0;
+    let nags = 0;
 
-    for (let step = 0; step < MAX_STEPS; step++) {
-      const reply = await this.send(prompt, events);
+    while (step < MAX_STEPS) {
+      let reply: Completion;
+      try {
+        reply = await this.send(prompt, events);
+      } catch (error) {
+        // The backend refused the message and said to slow down. The browser
+        // answers that with a Retry button; this waits and sends the same
+        // prompt again. Waiting is not a step, because the model never got to
+        // say anything - and the refused message was not stored, so sending it
+        // again leaves no duplicate in the chat.
+        if (!(error instanceof SlowDown) || waits >= MAX_WAITS) throw error;
+        waits += 1;
+        const pause = Math.min(WAIT_MS * 2 ** (waits - 1), MAX_WAIT_MS);
+        events.onWait?.(error.message, pause);
+        await new Promise((done) => setTimeout(done, pause));
+        continue;
+      }
+      step += 1;
       const raw = reply.text;
 
       // Nothing at all came back: a backend hiccup, not a failure of the last
@@ -263,6 +303,12 @@ export class Agent {
       empty = 0;
 
       const { command, skipped } = commandIn(raw);
+      if (command === "" && RAW_CALL.test(raw) && nags < MAX_NAGS) {
+        nags += 1;
+        events.onComment?.("that reply was raw tool-call markup, so it is being asked for one ```sh block");
+        prompt = PROTOCOL_NAG;
+        continue;
+      }
       // No command means the task is finished, or the model needs an answer
       // from you. Either way the reply is what you get.
       if (command === "") return final(raw, skipped);

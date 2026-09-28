@@ -37,7 +37,7 @@ export type ChatSession = {
   lastMessageId: number;
 };
 
-export type HistoryMessage = { id: number; role: string; content: string };
+export type HistoryMessage = { id: number; role: string; content: string; done: boolean };
 export type Completion = { text: string; messageId?: string };
 
 /**
@@ -52,6 +52,26 @@ export class BizError extends Error {
     super(message);
   }
 }
+
+/**
+ * The backend is asking for a pause, not reporting a failure.
+ *
+ * It answers with a `hint` event and closes the stream without any reply: the
+ * chat stays clean, nothing is stored, and the browser shows a Retry button.
+ * The agent waits instead of giving up, and sending the same prompt again is
+ * safe for exactly the same reason.
+ */
+export class SlowDown extends Error {}
+
+/** The hint reasons that only mean "wait a moment". */
+const PAUSE_REASONS = new Set([
+  "rate_limit_reached",
+  "rate_limit",
+  "rate_limited",
+  "too_many_requests",
+  "concurrency_limit_reached",
+  "server_busy",
+]);
 
 /* ------------------------------------------------------------------ */
 /* the captured session                                                */
@@ -250,6 +270,31 @@ export async function createSession(session: Session): Promise<string> {
   return id;
 }
 
+/**
+ * The fragment kinds that are the reply itself. Everything else a message is
+ * made of - THINK, SEARCH, a kind that does not exist yet - is not the answer,
+ * so it is dropped rather than shown or run as a command.
+ */
+const ANSWER_KINDS = new Set(["RESPONSE", "ANSWER", "TEXT", "CONTENT"]);
+
+/**
+ * The text of one stored message. A message has no `content` field of its own:
+ * it is a list of typed fragments, and the words are in the fragments that say
+ * they are the reply. Reading `item.content` here would return "" for every
+ * message ever sent, which is how a reply that is sitting on the backend looks
+ * like no reply at all.
+ */
+function messageText(item: Record<string, unknown>): string {
+  if (typeof item["content"] === "string") return item["content"];
+  const list = item["fragments"];
+  if (!Array.isArray(list)) return "";
+  return list
+    .filter((raw): raw is Record<string, unknown> => !!raw && typeof raw === "object")
+    .filter((fragment) => ANSWER_KINDS.has(String(fragment["type"] ?? "").toUpperCase()))
+    .map((fragment) => (typeof fragment["content"] === "string" ? fragment["content"] : ""))
+    .join("");
+}
+
 /** Every message of a chat, oldest first. */
 export async function history(session: Session, chatId: string): Promise<HistoryMessage[]> {
   const data = payload(
@@ -262,7 +307,8 @@ export async function history(session: Session, chatId: string): Promise<History
     .map((item) => ({
       id: Number(item["message_id"] ?? 0),
       role: String(item["role"] ?? ""),
-      content: String(item["content"] ?? ""),
+      content: messageText(item),
+      done: String(item["status"] ?? "") !== "WIP",
     }));
 }
 
@@ -271,11 +317,10 @@ export async function history(session: Session, chatId: string): Promise<History
 /* ------------------------------------------------------------------ */
 
 /**
- * The fragment kinds that are the reply itself. Everything else a message is
- * made of - THINK, SEARCH, a kind that does not exist yet - is not the answer,
- * so it is dropped rather than shown or run as a command.
+ * How the backend ended a stream it answered nothing on. `pause` is the
+ * difference between "too fast, send it again" and "this was refused".
  */
-const ANSWER_KINDS = new Set(["RESPONSE", "ANSWER", "TEXT", "CONTENT"]);
+export type Refusal = { message: string; pause: boolean };
 
 export type StreamReader = {
   /** Feed one SSE line. Throws BizError when the stream reports one. */
@@ -283,6 +328,8 @@ export type StreamReader = {
   /** The answer so far, without any of the model's reasoning. */
   text(): string;
   messageId(): string;
+  /** Set when the backend closed the stream without replying. */
+  refusal(): Refusal | null;
 };
 
 /**
@@ -301,6 +348,7 @@ export function createStreamReader(): StreamReader {
   let field = ""; // the last path seen, for changes that omit it
   let kind: "think" | "answer" = "think";
   let event = "";
+  let refusal: Refusal | null = null;
 
   const fragments = (list: unknown[]): void => {
     for (const raw of list) {
@@ -384,12 +432,30 @@ export function createStreamReader(): StreamReader {
       if (event === "ready" && item["response_message_id"] != null) {
         messageId = String(item["response_message_id"]);
       }
+
+      // A hint is how the backend says it will not answer: the reply is cleared
+      // and the stream closes empty. Left unread, "Messages too frequent" is
+      // indistinguishable from a model that had nothing to say.
+      if (event === "hint") {
+        event = "";
+        const reason = String(item["finish_reason"] ?? "").trim();
+        const said = String(item["content"] ?? "").trim();
+        if (String(item["type"] ?? "").toLowerCase() === "error" || reason !== "") {
+          refusal = {
+            message: said !== "" ? said : reason !== "" ? reason : "the backend stopped the reply",
+            pause: PAUSE_REASONS.has(reason),
+          };
+        }
+        return; // a hint carries no part of the message
+      }
+
       event = "";
       if (typeof item["p"] === "string") field = item["p"];
       apply(field, item["v"], item["o"]);
     },
     text: () => answer,
     messageId: () => messageId,
+    refusal: () => refusal,
   };
 }
 
@@ -403,7 +469,9 @@ async function recoverAnswer(session: Session, chatId: string, afterId: number):
       if (attempt >= 2) return null; // the turn was never stored
       continue;
     }
-    const answer = mine.filter((message) => message.content.trim() !== "").pop();
+    // Only a finished message is an answer; a half-written one would be pasted
+    // back as a command that is missing its last line.
+    const answer = mine.filter((message) => message.done && message.content.trim() !== "").pop();
     if (answer) return { text: answer.content, messageId: String(answer.id) };
   }
   return null;
@@ -562,6 +630,14 @@ export async function complete(session: Session, turn: Turn, wasmPath: string): 
 
   const text = stream.text();
   if (text.trim() === "") {
+    // Nothing was said because the backend refused the message. It was not
+    // stored either, so waiting and sending the same prompt again adds no
+    // duplicate to the chat - this is the Retry button the browser shows.
+    const refused = stream.refusal();
+    if (refused) {
+      if (refused.pause) throw new SlowDown(refused.message);
+      throw new Error(`chat.deepseek.com refused the message: ${refused.message}`);
+    }
     const recovered = await recoverAnswer(session, turn.chatId, Number(turn.parentId) || 0);
     if (recovered) return recovered;
   }

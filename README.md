@@ -107,6 +107,32 @@ Process exited with 0
 A failing command is **not** an error. The output goes back like any other, so the model can read
 what broke and try again.
 
+## "Messages too frequent. Try again later."
+
+DeepSeek throttles a session that sends messages quickly, and it does it in the awkward way: the
+stream opens, then closes **without a single fragment**, and the reason is in a `hint` event the
+agent has to read for itself.
+
+```
+event: hint
+data: {"type":"error","content":"Messages too frequent. Try again later.",
+       "clear_response":true,"finish_reason":"rate_limit_reached"}
+event: close
+data: {"click_behavior":"retry","auto_resume":false}
+```
+
+In a browser that is the **Retry** button. Here the agent presses it for you: nothing was stored,
+so the same prompt is sent again after a wait — 10s, then 20s, then 40s, capped at 60s, up to
+`DEEPSEEK_MAX_WAITS` times. A run that hits the limit therefore pauses and carries on rather than
+stopping with a reply it never got; you see the wait on the way past:
+
+```
+… Messages too frequent. Try again later. Waiting 20s, then sending the same prompt again.
+```
+
+If a reply *was* stored but the connection died mid-stream, the answer is read back out of the
+chat instead of being thrown away.
+
 ## Environment
 
 | Variable | Default | Meaning |
@@ -118,6 +144,8 @@ what broke and try again.
 | `DEEPSEEK_SEARCH_ENABLED` | `0` | web search |
 | `DEEPSEEK_MAX_ITERATIONS` | `50` | commands per task before it stops |
 | `DEEPSEEK_SHELL_TIMEOUT_MS` | `120000` | per-command timeout |
+| `DEEPSEEK_MAX_WAITS` | `8` | how many times to wait out "Messages too frequent" |
+| `DEEPSEEK_RETRY_WAIT_MS` | `10000` | the first wait; it doubles each time, up to 60s |
 | `ANYAGENT_SHELL` | platform shell | shell to run commands in |
 | `ANYAGENT_HOST` | `https://chat.deepseek.com` | used by the tests |
 
@@ -141,12 +169,13 @@ npm test
 Two suites, both real:
 
 - **`test-agent.mjs`** — offline. Which reply text is a command, which stream text is the answer,
-  the starter prompt, and the shell runner actually running (`exit 3` is reported as 3, stderr is
-  never hidden).
+  the starter prompt, the `hint` events that mean "not answering" versus "wait", and the shell
+  runner actually running (`exit 3` is reported as 3, stderr is never hidden).
 - **`test-http.mjs`** — end to end. The real CLI, real HTTP, real proof-of-work module and a real
   command creating a real file, against a stand-in chat.deepseek.com on localhost. It checks that
-  the answer is pasted back as the output plus the exit code, and that a command which appeared
-  only in the model's *thinking* is **not** run.
+  the answer is pasted back as the output plus the exit code, that a command which appeared only
+  in the model's *thinking* is **not** run, that a throttle is waited out and the same prompt is
+  sent again, and that a stream cut mid-reply is recovered from the chat.
 
 ## Notes
 
@@ -163,7 +192,7 @@ Two suites, both real:
 
 | Version | What it is |
 |---|---|
-| `main` (v5.0.0) | this one — direct HTTPS, the `sh`-block protocol |
+| `main` (v5.0.1) | this one — direct HTTPS, the `sh`-block protocol |
 | `browser` (v4.0.1) | drives chat.deepseek.com in a real browser |
 | `ollama` (v3.0.1) | the same agent against a local Ollama model |
 | `deepseek-web` (v2.0.0) | browser transport, JSON `{"text","command"}` protocol |

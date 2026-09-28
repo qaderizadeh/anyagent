@@ -64,6 +64,8 @@ Env:
   DEEPSEEK_SEARCH_ENABLED    web search (default: off)
   DEEPSEEK_MAX_ITERATIONS    loop limit (default: 50)
   DEEPSEEK_SHELL_TIMEOUT_MS  command timeout (default: 120000)
+  DEEPSEEK_MAX_WAITS         waits for "too frequent" (default: 8)
+  DEEPSEEK_RETRY_WAIT_MS     first wait, doubling (default: 10000)
   ANYAGENT_SHELL             shell to run commands in (default: cmd on
                              Windows, /bin/sh elsewhere)
   ANYAGENT_HOST              backend to talk to (tests only)`;
@@ -231,6 +233,8 @@ async function main(): Promise<void> {
           }
         },
         onNewSession: () => console.log(dim("  ! the previous chat was gone; started a new one")),
+        onWait: (message, ms) =>
+          console.log(dim(`  … ${message} Waiting ${Math.round(ms / 1000)}s, then sending the same prompt again.`)),
       });
     } finally {
       busy = false;
