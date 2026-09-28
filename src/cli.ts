@@ -66,6 +66,7 @@ Env:
   DEEPSEEK_SHELL_TIMEOUT_MS  command timeout (default: 120000)
   DEEPSEEK_MAX_WAITS         waits for "too frequent" (default: 8)
   DEEPSEEK_RETRY_WAIT_MS     first wait, doubling (default: 10000)
+  DEEPSEEK_POW_WASM_PATH     proof-of-work solver (default: with the code)
   ANYAGENT_SHELL             shell to run commands in (default: cmd on
                              Windows, /bin/sh elsewhere)
   ANYAGENT_HOST              backend to talk to (tests only)`;

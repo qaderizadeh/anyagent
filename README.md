@@ -133,6 +133,27 @@ stopping with a reply it never got; you see the wait on the way past:
 If a reply *was* stored but the connection died mid-stream, the answer is read back out of the
 chat instead of being thrown away.
 
+## "DeepSeek error (40300): MISSING_HEADER"
+
+Every message needs an `x-ds-pow-response` header, and a message sent without one is rejected with
+`40300 MISSING_HEADER` — an error that explains nothing, because the reason is on this side: the
+header could not be worked out.
+
+The reason it used to happen *sometimes* is where the solver was looked for.
+`sha3_wasm_bg.wasm` was resolved from the working directory, so the agent worked when it was
+started from the repo and failed with that 40300 when it was started from anywhere else. The
+solver is now found next to the code first, and the working directory after that.
+
+A solve that fails is no longer dropped either. It is retried with a fresh challenge, and a
+backend that still calls the header missing gets the message once more with a new one — the
+browser's reload. A header that cannot be worked out at all ends the turn with the reason
+instead of sending a message that is certain to be rejected:
+
+```
+Could not work out the x-ds-pow-response header for /api/v0/chat/completion, so the message was not sent.
+Cannot read the proof-of-work solver at /somewhere/sha3_wasm_bg.wasm
+```
+
 ## Environment
 
 | Variable | Default | Meaning |
@@ -146,6 +167,7 @@ chat instead of being thrown away.
 | `DEEPSEEK_SHELL_TIMEOUT_MS` | `120000` | per-command timeout |
 | `DEEPSEEK_MAX_WAITS` | `8` | how many times to wait out "Messages too frequent" |
 | `DEEPSEEK_RETRY_WAIT_MS` | `10000` | the first wait; it doubles each time, up to 60s |
+| `DEEPSEEK_POW_WASM_PATH` | next to the code | the proof-of-work solver, if you move it |
 | `ANYAGENT_SHELL` | platform shell | shell to run commands in |
 | `ANYAGENT_HOST` | `https://chat.deepseek.com` | used by the tests |
 
@@ -175,13 +197,16 @@ Two suites, both real:
   command creating a real file, against a stand-in chat.deepseek.com on localhost. It checks that
   the answer is pasted back as the output plus the exit code, that a command which appeared only
   in the model's *thinking* is **not** run, that a throttle is waited out and the same prompt is
-  sent again, and that a stream cut mid-reply is recovered from the chat.
+  sent again, that a stream cut mid-reply is recovered from the chat, that a challenge which fails
+  once or a header the backend calls missing is not a lost turn, and that a solver which cannot
+  work is reported instead of turning into a `40300`.
 
 ## Notes
 
-- **Proof of work is best effort.** The challenge is solved with the `sha3_wasm_bg.wasm` that
-  ships here; if this build cannot solve one, the request is still sent and whatever the backend
-  says about it is what you see — instead of a local "could not be solved" that explains nothing.
+- **Proof of work is required, not best effort.** Each message carries an `x-ds-pow-response`
+  header solved with the `sha3_wasm_bg.wasm` that ships here, and a challenge that fails is
+  retried. Sending a message without it produces `40300 MISSING_HEADER`, which is why a header
+  that cannot be worked out is now reported plainly rather than dropped.
 - **The model's thinking is never read.** A message arrives as typed fragments (thinking,
   answer), and only the fragments that declare themselves the answer are used. A command the model
   merely *considered* cannot be run.
@@ -192,7 +217,7 @@ Two suites, both real:
 
 | Version | What it is |
 |---|---|
-| `main` (v5.0.1) | this one — direct HTTPS, the `sh`-block protocol |
+| `main` (v5.0.2) | this one — direct HTTPS, the `sh`-block protocol |
 | `browser` (v4.0.1) | drives chat.deepseek.com in a real browser |
 | `ollama` (v3.0.1) | the same agent against a local Ollama model |
 | `deepseek-web` (v2.0.0) | browser transport, JSON `{"text","command"}` protocol |

@@ -7,8 +7,12 @@
  * reply is a command, and which text in the stream is the answer.
  */
 
+import { existsSync } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
 import { commandIn, blocks, proseOf, runShell, pasteBack, STARTER, shellName } from "./dist/agent.js";
-import { createStreamReader, BizError } from "./dist/deepseek.js";
+import { createStreamReader, BizError, resolveWasmPath } from "./dist/deepseek.js";
 
 let passed = 0;
 let failed = 0;
@@ -225,6 +229,24 @@ check("refusal() is null on a stream that never refused", theReaderRefusal());
 function theReaderRefusal() {
   return createStreamReader().refusal() === null;
 }
+
+/* ------------------------------------------------------------------ */
+/* the proof-of-work solver is found wherever the CLI is run from      */
+/* ------------------------------------------------------------------ */
+
+// This is what made a message come back as 40300 MISSING_HEADER: the solver
+// was looked for in the working directory only, so the agent worked from the
+// repo and failed from anywhere else.
+const project = process.cwd();
+const override = process.env.DEEPSEEK_POW_WASM_PATH;
+delete process.env.DEEPSEEK_POW_WASM_PATH;
+process.chdir(os.tmpdir());
+const solver = resolveWasmPath();
+process.chdir(project);
+if (override != null) process.env.DEEPSEEK_POW_WASM_PATH = override;
+
+check("the solver is found from another working directory", existsSync(solver));
+check("and it is the one that ships with the code", path.resolve(solver) === path.join(project, "sha3_wasm_bg.wasm"));
 
 /* ------------------------------------------------------------------ */
 

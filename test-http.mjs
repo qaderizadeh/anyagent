@@ -32,13 +32,24 @@ function check(name, condition) {
 /* a stand-in chat.deepseek.com                                        */
 /* ------------------------------------------------------------------ */
 
+/**
+ * One real proof-of-work challenge, captured from the backend.
+ *
+ * The solver here is not a stub - it is the same wasm and the same algorithm
+ * the live site uses - and it only understands a challenge the algorithm
+ * itself produced: an invented one comes back unsolved, which is exactly what
+ * a missing pow header looks like in production. So the stand-in hands out a
+ * real one. It takes about 20ms to solve, and the stand-in never looks at the
+ * answer.
+ */
 const CHALLENGE = {
-  algorithm: "sha3",
-  challenge: "abcdef",
-  salt: "salt",
-  expire_at: 0,
-  difficulty: 1,
-  signature: "sig",
+  algorithm: "DeepSeekHashV1",
+  challenge: "591c4d8f68e461bcf83e7c29b4f3329521f39c18f07dfc9f4f3b67b0c86972b0",
+  salt: "f30a087a1eb239abdbb0",
+  signature: "185e0a8c4fe20072150381868d2d3070ed94661ea1e9dbf2b9099614c1aa72d3",
+  difficulty: 144000,
+  expire_at: 1790607677246,
+  expire_after: 300000,
   target_path: "/api/v0/chat/completion",
 };
 
@@ -142,6 +153,9 @@ const prompts = [];
 let completions = 0;
 let slowdowns = 0;
 let markups = 0;
+let challenges = 0;
+let stales = 0;
+let headerless = 0;
 let mode = "ok";
 
 const server = http.createServer((request, response) => {
@@ -160,11 +174,25 @@ const server = http.createServer((request, response) => {
     if (url.startsWith("/api/v0/chat/history_messages")) {
       return send(OK(mode === "cut" ? STORED : { chat_messages: [] }));
     }
-    if (url.startsWith("/api/v0/chat/create_pow_challenge")) return send(OK({ challenge: CHALLENGE }));
+    if (url.startsWith("/api/v0/chat/create_pow_challenge")) {
+      challenges += 1;
+      // A challenge the backend will not hand over: a blip once, or for good.
+      if (mode === "powdead" || (mode === "pow" && challenges === 1)) {
+        return send(JSON.stringify({ code: 0, data: { biz_code: 50001, biz_msg: "challenge unavailable" } }));
+      }
+      return send(OK({ challenge: CHALLENGE }));
+    }
 
     if (url.startsWith("/api/v0/chat/completion")) {
       const sent = JSON.parse(Buffer.concat(body).toString() || "{}");
       prompts.push(sent.prompt ?? "");
+      if (request.headers["x-ds-pow-response"] == null) headerless += 1;
+      if (mode === "stale") {
+        // The header was sent and the backend still says it is not there, the
+        // way a challenge that went stale does.
+        if (stales++ === 0) return send(JSON.stringify({ code: 40300, msg: "MISSING_HEADER", data: null }));
+        return send(completions++ === 0 ? TURN_ONE.join("\n") : TURN_TWO.join("\n"), "text/event-stream");
+      }
       if (mode === "refuse") {
         // A refusal is reported in the body with HTTP 200, not an error status.
         return send(JSON.stringify({ code: 0, data: { biz_code: 40003, biz_msg: "Authorization Failed" } }));
@@ -225,7 +253,7 @@ const run = await cli("make me a marker file", work);
 if (run.code !== 0) console.log(`--- CLI said ---\n${run.out}\n---`);
 
 check("the CLI exits cleanly", run.code === 0);
-check("the banner names the build", run.out.includes("AnyAgent 5.0.1"));
+check("the banner names the build", run.out.includes("AnyAgent 5.0.2"));
 check("the command is shown as it runs", run.out.includes("-> $ node -e"));
 check("the result is shown", run.out.includes("ok"));
 check("the final answer is printed", run.out.includes("Done - marker.txt is in place."));
@@ -288,6 +316,41 @@ check("raw tool-call markup is not printed as the answer", markup.code === 0 && 
 check("it is asked for one sh block instead", markup.out.includes("asked for one ```sh block"));
 check("the task still finishes", markup.out.includes("Done - marker.txt is in place."));
 check("the markup is sent back, not run", prompts.at(-1).includes("raw tool-call markup"));
+
+/* ------------------------------------------------------------------ */
+/* the pow header: never dropped, and never a mystery                  */
+/* ------------------------------------------------------------------ */
+
+// The challenge fails once, the way a blip does. The turn must still happen.
+mode = "pow";
+const asked = challenges;
+const blip = await cli("say hi", work);
+
+check("a failed challenge is asked for again", challenges > asked);
+check("a blip is not a failed task", blip.code === 0);
+check("the task still finishes", blip.out.includes("Done - marker.txt is in place."));
+check("and no missing-header error is shown", !blip.out.includes("40300"));
+
+// The header is there and the backend calls it missing: send it again with a
+// fresh challenge, which is what the browser's reload does.
+mode = "stale";
+const stale = await cli("say hi", work);
+
+check("a stale header is not a dead end", stale.code === 0);
+check("the turn is made again with it", stale.out.includes("Done - marker.txt is in place."));
+check("no missing-header error is shown", !stale.out.includes("40300"));
+
+// A solver that cannot work at all has to say so - that message is the whole
+// point, because the backend's own answer says nothing about why.
+mode = "powdead";
+const dead = await cli("say hi", work);
+
+check("a header that cannot be worked out stops the turn", dead.code === 1);
+check("and is reported for what it is", dead.out.includes("Could not work out the x-ds-pow-response header"));
+check("the reason is kept", dead.out.includes("challenge unavailable"));
+check("never as the backend's 40300", !dead.out.includes("40300"));
+
+check("no message is ever sent without a pow header", headerless === 0);
 
 /* ------------------------------------------------------------------ */
 

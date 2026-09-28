@@ -14,14 +14,20 @@
  *   POST /api/v0/chat/completion            send one message (SSE stream)
  */
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const HOST = (process.env["ANYAGENT_HOST"] ?? "https://chat.deepseek.com").replace(/\/+$/, "");
 const COMPLETION = "/api/v0/chat/completion";
 const SESSION_FILE = "DEEPSEEK_SESSION_JSON";
 const WASM_FILE = "sha3_wasm_bg.wasm";
+/** The two ways the backend says the pow header was no good. */
+const POW_MISSING = 40300; // never arrived
+const POW_INVALID = 40301; // stale or wrong
+const POW_ATTEMPTS = 3; // a challenge is cheap; a blip is worth another go
+const POW_RETRY_MS = 500;
 const DEFAULT_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:154.0) Gecko/20100101 Firefox/154.0";
 
@@ -147,7 +153,16 @@ export function loadSession(): Session {
 export function resolveWasmPath(): string {
   const fromEnv = process.env["DEEPSEEK_POW_WASM_PATH"];
   if (fromEnv != null && fromEnv.trim() !== "") return path.resolve(process.cwd(), fromEnv);
-  return path.resolve(process.cwd(), WASM_FILE);
+  // It ships next to the code, so look there first: beside the module (src/) or
+  // one level up from it (dist/). Resolving from here rather than from
+  // process.cwd() is what lets the CLI be run from any directory - a solver
+  // that cannot be found means a message that is never sent.
+  const beside = path.dirname(fileURLToPath(import.meta.url));
+  for (const dir of [beside, path.dirname(beside), process.cwd()]) {
+    const candidate = path.join(dir, WASM_FILE);
+    if (existsSync(candidate)) return candidate;
+  }
+  return path.join(beside, "..", WASM_FILE);
 }
 
 /* ------------------------------------------------------------------ */
@@ -171,6 +186,10 @@ function offline(error: unknown): string {
   return [err?.cause?.code, err?.cause?.message ?? err?.message]
     .filter((part): part is string => typeof part === "string" && part !== "")
     .join(": ");
+}
+
+function reason(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** Turn a body like {"code":0,"data":{"biz_code":5,"biz_msg":"..."}} into an error. */
@@ -482,14 +501,30 @@ async function recoverAnswer(session: Session, chatId: string, afterId: number):
 /* ------------------------------------------------------------------ */
 
 /**
- * The x-ds-pow-response header the backend asks for, worked out with the
- * vendored sha3 wasm, or null if this build cannot work it out.
+ * The x-ds-pow-response header, worked out with the vendored sha3 wasm.
  *
- * Best effort on purpose: the request is sent either way, so a solver that
- * cannot cope shows up as the backend's own answer instead of a local dead end
- * that says nothing about why.
+ * It is not optional: a message sent without it comes back as `40300
+ * MISSING_HEADER`, which says nothing about why. So a solve that fails is
+ * retried with a fresh challenge and then reported for what it is, instead of
+ * being dropped and left to look like the backend's mystery.
  */
-async function powHeader(session: Session, targetPath: string, wasmPath: string): Promise<string | null> {
+async function powHeader(session: Session, targetPath: string, wasmPath: string): Promise<string> {
+  let last: unknown;
+  for (let attempt = 1; attempt <= POW_ATTEMPTS; attempt++) {
+    try {
+      return await solvePow(session, targetPath, wasmPath);
+    } catch (error) {
+      last = error;
+      if (attempt < POW_ATTEMPTS) await new Promise((done) => setTimeout(done, POW_RETRY_MS * attempt));
+    }
+  }
+  throw new Error(
+    `Could not work out the x-ds-pow-response header for ${targetPath}, so the message was not sent.\n` +
+      reason(last),
+  );
+}
+
+async function solvePow(session: Session, targetPath: string, wasmPath: string): Promise<string> {
   const raw = await call(session, "/api/v0/chat/create_pow_challenge", {
     method: "POST",
     body: { target_path: targetPath },
@@ -503,8 +538,9 @@ async function powHeader(session: Session, targetPath: string, wasmPath: string)
   }
 
   // It ships with the project, next to the code that uses it.
-  const bytes = await readFile(wasmPath).catch(() => null);
-  if (!bytes) return null;
+  const bytes = await readFile(wasmPath).catch(() => {
+    throw new Error(`Cannot read the proof-of-work solver at ${wasmPath}`);
+  });
 
   const { instance } = await WebAssembly.instantiate(bytes, {});
   const exports = instance.exports;
@@ -514,7 +550,9 @@ async function powHeader(session: Session, targetPath: string, wasmPath: string)
   const solve = exports["wasm_solve"] as
     | ((ret: number, cPtr: number, cLen: number, pPtr: number, pLen: number, difficulty: number) => void)
     | undefined;
-  if (!memory || !malloc || !push || !solve) return null;
+  if (!memory || !malloc || !push || !solve) {
+    throw new Error(`The proof-of-work solver at ${wasmPath} is not the expected build.`);
+  }
 
   const encoder = new TextEncoder();
   const write = (value: string): { ptr: number; len: number } => {
@@ -537,7 +575,7 @@ async function powHeader(session: Session, targetPath: string, wasmPath: string)
     const view = new DataView(memory.buffer);
     const solved = view.getInt32(ret, true);
     const answer = view.getFloat64(ret + 8, true);
-    if (solved === 0 || !Number.isFinite(answer)) return null;
+    if (solved === 0 || !Number.isFinite(answer)) throw new Error("the proof-of-work solver found no answer");
     return Buffer.from(
       JSON.stringify({
         algorithm: challenge["algorithm"],
@@ -567,9 +605,47 @@ export type Turn = {
   modelType?: string;
 };
 
-export async function complete(session: Session, turn: Turn, wasmPath: string): Promise<Completion> {
-  const pow = await powHeader(session, COMPLETION, wasmPath).catch(() => null);
+/**
+ * Post one message with a fresh x-ds-pow-response header, and hand back the
+ * stream once the backend accepts it.
+ *
+ * If the backend still says the header was missing or stale - a challenge that
+ * expired while the message was being built, say - it is sent once more with a
+ * new one, which is what a browser reload does.
+ */
+async function sendWithPow(session: Session, wasmPath: string, body: Record<string, unknown>): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    const pow = await powHeader(session, COMPLETION, wasmPath);
 
+    let response: Response;
+    try {
+      response = await fetch(`${HOST}${COMPLETION}`, {
+        method: "POST",
+        headers: { ...headers(session), "x-ds-pow-response": pow },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(300_000),
+      });
+    } catch (error) {
+      throw new Error(`Cannot reach chat.deepseek.com (${COMPLETION}): ${offline(error) || "unknown network error"}`);
+    }
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error(`chat completion failed: HTTP ${response.status}\n${text.slice(0, 300)}`);
+    }
+
+    // A stream means the message was taken; anything else is a rejection.
+    if ((response.headers.get("content-type") ?? "").includes("text/event-stream")) return response;
+
+    const text = await response.text().catch(() => "");
+    const biz = bizFrom(text);
+    const stale = biz !== null && (biz.code === POW_MISSING || biz.code === POW_INVALID);
+    if (stale && attempt === 0) continue;
+    throw biz ?? new Error(`Unexpected completion response:\n${text.slice(0, 300)}`);
+  }
+}
+
+export async function complete(session: Session, turn: Turn, wasmPath: string): Promise<Completion> {
   const body: Record<string, unknown> = {
     chat_session_id: turn.chatId,
     prompt: turn.prompt,
@@ -582,28 +658,7 @@ export async function complete(session: Session, turn: Turn, wasmPath: string): 
   }
   if (turn.modelType) body["model_type"] = turn.modelType;
 
-  let response: Response;
-  try {
-    response = await fetch(`${HOST}${COMPLETION}`, {
-      method: "POST",
-      headers: pow === null ? headers(session) : { ...headers(session), "x-ds-pow-response": pow },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(300_000),
-    });
-  } catch (error) {
-    throw new Error(`Cannot reach chat.deepseek.com (${COMPLETION}): ${offline(error) || "unknown network error"}`);
-  }
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`chat completion failed: HTTP ${response.status}\n${text.slice(0, 300)}`);
-  }
-
-  // Anything that is not a stream is a backend failure, never an empty answer.
-  if (!(response.headers.get("content-type") ?? "").includes("text/event-stream")) {
-    const text = await response.text().catch(() => "");
-    throw bizFrom(text) ?? new Error(`Unexpected completion response:\n${text.slice(0, 300)}`);
-  }
+  const response = await sendWithPow(session, wasmPath, body);
 
   const reader = response.body?.getReader();
   if (!reader) throw new Error("chat completion returned an empty body.");
